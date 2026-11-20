@@ -547,6 +547,70 @@ local EMOJI_TEXT = {
 }
 
 --- Replaces emoji the fonts cannot show. With `strip`, drops them instead (for names).
+-- Names of emoji (":pink_heart:"), loaded the first time one is needed
+local emoji_names
+local function emojiNames()
+    if not emoji_names then
+        local ok, names = pcall(require, "discord_emoji_names")
+        emoji_names = ok and names or {}
+    end
+    return emoji_names
+end
+
+local ZWJ = "\226\128\141"
+
+local function utf8Char(s, i)
+    local b = s:byte(i)
+    local len = (b < 0x80 and 1) or (b < 0xE0 and 2) or (b < 0xF0 and 3) or 4
+    return s:sub(i, i + len - 1)
+end
+
+--- Replaces multi-part emoji (joined with zero width joiners, tag sequences
+-- like the England flag, keycaps) by their name: 👨‍💻 -> :man_technologist:
+local function namedSequences(text)
+    if not (text:find(ZWJ, 1, true) or text:find("\243\160", 1, true) or text:find("\226\131\163", 1, true)) then
+        return text
+    end
+    local names = emojiNames()
+    local out, i, n = {}, 1, #text
+    while i <= n do
+        local c = utf8Char(text, i)
+        local parts, j = { c }, i + #c
+        while j <= n do
+            local nx = utf8Char(text, j)
+            if nx == ZWJ and j + #nx <= n then
+                local after = utf8Char(text, j + #nx)
+                table.insert(parts, nx)
+                table.insert(parts, after)
+                j = j + #nx + #after
+            elseif nx == "\226\131\163" or (nx:byte(1) == 243 and nx:byte(2) == 160) then
+                -- keycap mark, or tag letters (subdivision flags)
+                table.insert(parts, nx)
+                j = j + #nx
+            else
+                break
+            end
+        end
+        local matched
+        for k = #parts, 2, -1 do
+            local name = names[table.concat(parts, "", 1, k)]
+            if name then
+                matched = k
+                table.insert(out, ":" .. name .. ":")
+                break
+            end
+        end
+        if matched then
+            for k = 1, matched do i = i + #parts[k] end
+        else
+            table.insert(out, c)
+            i = i + #c
+        end
+    end
+    -- Leftover tag letters are invisible: drop them
+    return (table.concat(out):gsub("\243\160[\128-\129][\128-\191]", ""))
+end
+
 function DiscordAPI.cleanEmoji(text, strip)
     if not text then return text end
     if strip then
@@ -559,8 +623,11 @@ function DiscordAPI.cleanEmoji(text, strip)
         end)
         return (text:gsub("^%s+", ""):gsub("%s+$", ""))
     end
-    -- Variation selectors, zero width joiners and skin tones
-    text = text:gsub("\239\184\143", ""):gsub("\226\128\141", ""):gsub("\240\159\143[\187-\191]", "")
+    -- Variation selectors and skin tones (zero width joiners stay for now: they
+    -- join multi-part emoji such as 👨‍💻, which have a name of their own)
+    text = text:gsub("\239\184[\142\143]", ""):gsub("\240\159\143[\187-\191]", "")
+    text = namedSequences(text)
+    text = text:gsub("\226\128\141", "")
     -- Country flags are pairs of regional indicator letters: 🇵🇹 -> :flag_pt:
     text = text:gsub("\240\159\135([\166-\191])\240\159\135([\166-\191])", function(a, b)
         return ":flag_" .. string.char(a:byte() - 166 + 97, b:byte() - 166 + 97) .. ":"
@@ -568,7 +635,10 @@ function DiscordAPI.cleanEmoji(text, strip)
     text = text:gsub("[\226\240][\128-\191]+", function(ch)
         local mapped = EMOJI_TEXT[ch]
         if mapped then return mapped end
-        if ch:byte(1) == 240 and ch:byte(2) == 159 then return "[emoji]" end
+        if ch:byte(1) == 240 and ch:byte(2) == 159 then
+            local name = emojiNames()[ch]
+            return name and (":" .. name .. ":") or "[emoji]"
+        end
         return nil
     end)
     return text
