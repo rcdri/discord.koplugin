@@ -61,7 +61,7 @@ Text first: no voice or video, and images only when you ask for them. Just your 
 - **Reading activity** (optional): your profile shows "Playing KOReader" with the book title, author and progress while a book is open
 - **Battery saver**: pauses the background connection and slows polling below a battery level
 - **Fast start**: the connection state is cached on disk, lists open at once and sessions are resumed after restarts
-- Common emoji rendered as text, since e-reader fonts lack emoji glyphs (country flags as `:flag_pt:`)
+- Emoji shown as text, since e-reader fonts lack emoji glyphs: common ones as emoticons (`xD`, `<3`), every other one by its name (`:pink_heart:`, `:man_technologist:`, `:flag_pt:`)
 - **Secure connections**: server certificates and host names are verified on every connection (REST, real time and updates), so nobody on the same Wi-Fi can read your login or fake an update; optional **HTTP proxy** (*Settings → Network*)
 - Interface in English and Spanish (follows KOReader's language)
 

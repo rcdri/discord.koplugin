@@ -56,6 +56,15 @@ You don't have to do this by hand: on every push to `main` a GitHub Action runs 
 
 Bug reports and pull requests are welcome. Please test changes on a real device (or the KOReader emulator) and keep the plugin usable on e-ink: few screen refreshes, nothing loaded automatically that could be loaded on demand.
 
+### Emoji names
+
+`discord_emoji_names.lua` (the name shown for each emoji, like `:pink_heart:`) is generated from [emojibase-data](https://www.npmjs.com/package/emojibase-data). To refresh it when new emoji come out:
+
+```sh
+npm pack emojibase-data && tar -xzf emojibase-data-*.tgz
+python3 tools/emoji_names.py package
+```
+
 ## Releasing (maintainers)
 
 1. Bump `version` in `_meta.lua` (it is the only place the version lives) and push to `main`.
