@@ -117,6 +117,27 @@ local ChatView = InputContainer:extend{
 
 ChatView.formatWhen = formatWhen
 
+-- Shortcuts typed at the start of a message, expanded before sending like Discord does.
+-- Each returns the message to send from the text that follows the command.
+local SHORTCUTS = {
+    shrug = function(rest) return (rest ~= "" and rest .. " " or "") .. "¯\\_(ツ)_/¯" end,
+    tableflip = function(rest) return (rest ~= "" and rest .. " " or "") .. "(╯°□°)╯︵ ┻━┻" end,
+    unflip = function(rest) return (rest ~= "" and rest .. " " or "") .. "┬─┬ノ( º _ ºノ)" end,
+    lenny = function(rest) return (rest ~= "" and rest .. " " or "") .. "( ͡° ͜ʖ ͡°)" end,
+    me = function(rest) return rest ~= "" and ("_" .. rest .. "_") or nil end,
+    spoiler = function(rest) return rest ~= "" and ("||" .. rest .. "||") or nil end,
+}
+
+--- Expands /shrug, /me, /spoiler and friends. Other text is returned unchanged.
+function ChatView.expandShortcuts(text)
+    local name, rest = text:match("^/(%a+)%s*(.-)%s*$")
+    local expand = name and SHORTCUTS[name:lower()]
+    if not expand then return text end
+    -- Keep line breaks inside the rest of the message
+    rest = text:match("^/%a+[ \t]*(.-)%s*$")
+    return expand(rest) or text
+end
+
 local CACHE_KEEP = 30 -- channels kept in the offline cache
 
 local function cacheDir()
@@ -1399,6 +1420,7 @@ function ChatView:replyRef()
 end
 
 function ChatView:send(text, edit_msg)
+    if not edit_msg then text = ChatView.expandShortcuts(text) end
     local ok, data, code
     if edit_msg then
         ok, data, code = self.api:editMessage(self.channel.id, edit_msg.id, self:applyMentions(text))
@@ -1430,6 +1452,7 @@ end
 
 --- Queues `text` to be sent at `send_at` (unix time), or when the connection returns if nil.
 function ChatView:sendLater(text, send_at)
+    text = ChatView.expandShortcuts(text)
     Outbox.add(self.channel.id, self:applyMentions(text), self:replyRef(), send_at)
     self:setDraft(nil)
     self.reply_to = nil
