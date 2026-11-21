@@ -611,6 +611,24 @@ function DiscordAPI.idBefore(id)
     return out ~= "" and out or "0"
 end
 
+--- The smallest message id at a moment (unix seconds), for searching by date.
+-- Snowflakes are (ms since 2015) << 22, more digits than a double holds: multiply as text.
+function DiscordAPI.idAt(seconds)
+    local ms = math.max(0, math.floor(seconds) * 1000 - 1420070400000)
+    local digits, carry = {}, 0
+    for c in string.format("%.0f", ms):reverse():gmatch("%d") do
+        local v = tonumber(c) * 4194304 + carry
+        table.insert(digits, v % 10)
+        carry = math.floor(v / 10)
+    end
+    while carry > 0 do
+        table.insert(digits, carry % 10)
+        carry = math.floor(carry / 10)
+    end
+    local out = table.concat(digits):reverse():gsub("^0+", "")
+    return out ~= "" and out or "0"
+end
+
 function DiscordAPI.idLess(a, b)
     -- ids are strings, but be tolerant with numbers (a decoder may turn them into numbers)
     a, b = tostring(a or "0"), tostring(b or "0")

@@ -2015,6 +2015,91 @@ function ChatView:jumpTo(message_id)
     end)
 end
 
+--- Shows the first messages of a day (local time).
+function ChatView:jumpToDate(year, month, day)
+    local t = os.time{ year = year, month = month, day = day, hour = 0, min = 0, sec = 0 }
+    self.plugin:withLoading(_("Loading messages…"), function()
+        local ok, data = self.api:getMessages(self.channel.id, { limit = 1, after = DiscordAPI.idAt(t) })
+        if not ok then
+            UIManager:show(InfoMessage:new{ text = _("Could not load messages: ") .. tostring(data) })
+            return
+        end
+        if #data == 0 then
+            UIManager:show(InfoMessage:new{ text = T(_("No messages since %1."), os.date("%Y-%m-%d", t)) })
+            return
+        end
+        self:jumpTo(data[1].id)
+    end)
+end
+
+--- Parses what was typed in "Jump to": returns "date", y, m, d or "id", message_id, or nil.
+function ChatView.parseJump(text, channel_id)
+    text = (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local link_channel, link_msg = text:match("/channels/[^/%s]+/([^/%s]+)/(%d+)")
+    if link_msg then
+        if channel_id and link_channel ~= channel_id then return "other" end
+        return "id", link_msg
+    end
+    if text:match("^%d+$") and #text >= 15 then return "id", text end
+    local y, m, d = text:match("^(%d%d%d%d)[-/.](%d%d?)[-/.](%d%d?)$")
+    if y then
+        y, m, d = tonumber(y), tonumber(m), tonumber(d)
+        if m >= 1 and m <= 12 and d >= 1 and d <= 31 then return "date", y, m, d end
+    end
+    return nil
+end
+
+function ChatView:jumpDialog()
+    local input
+    local function go(text)
+        local kind, a, b, c = ChatView.parseJump(text, self.channel.id)
+        if kind == "id" then
+            UIManager:close(input)
+            self:jumpTo(a)
+        elseif kind == "date" then
+            UIManager:close(input)
+            self:jumpToDate(a, b, c)
+        elseif kind == "other" then
+            UIManager:show(InfoMessage:new{ text = _("That link is for another channel.") })
+        else
+            UIManager:show(InfoMessage:new{ text = _("Type a date like 2026-11-20, or a message ID or link.") })
+        end
+    end
+    input = InputDialog:new{
+        title = _("Jump to"),
+        description = _("A date (2026-11-20), or a message ID or link."),
+        input = "",
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(input) end },
+            {
+                text = _("Pick a date"),
+                callback = function()
+                    UIManager:close(input)
+                    local now = os.date("*t")
+                    local DateTimeWidget = require("ui/widget/datetimewidget")
+                    UIManager:show(DateTimeWidget:new{
+                        year = now.year,
+                        month = now.month,
+                        day = now.day,
+                        ok_text = _("Go"),
+                        title_text = _("Jump to date"),
+                        callback = function(time)
+                            self:jumpToDate(time.year, time.month, time.day)
+                        end,
+                    })
+                end,
+            },
+            {
+                text = _("Go"),
+                is_enter_default = true,
+                callback = function() go(input:getInputText()) end,
+            },
+        }},
+    }
+    UIManager:show(input)
+    input:onShowKeyboard()
+end
+
 function ChatView:viewFull(msg)
     local TextViewer = require("ui/widget/textviewer")
     UIManager:show(TextViewer:new{
@@ -2638,6 +2723,13 @@ function ChatView:showMenu()
                         self.scroll_widget:scrollToTop()
                         UIManager:setDirty(self, "ui")
                     end,
+                },
+            },
+            {
+                {
+                    text = _("Jump to date or message"),
+                    enabled = not self.offline,
+                    callback = function() close() self:jumpDialog() end,
                 },
             },
             {
