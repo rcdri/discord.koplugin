@@ -1,10 +1,12 @@
 --[[--
 Book club: per book and only when enabled, sends your reading progress
-(every X percent and/or at the end of each chapter) and your highlights to
-a channel of your choice.
+(every X percent and/or at the end of each chapter), your highlights and a
+summary of each reading session to a channel of your choice.
 ]]
 
+local ConfirmBox = require("ui/widget/confirmbox")
 local DiscordAPI = require("discord_api")
+local UIManager = require("ui/uimanager")
 local Outbox = require("discord_outbox")
 local logger = require("logger")
 local _ = require("discord_i18n")
@@ -18,6 +20,8 @@ Club.DEFAULTS = {
     step = 10,
     chapters = false,   -- send when a chapter is finished
     highlights = true,
+    summary = false,     -- post a summary of the reading session when closing the book
+    summary_ask = true,  -- ask before posting it
     last_pct = 0,
     last_chapter = nil,
     finished = false,
@@ -124,6 +128,91 @@ function Club.onAnnotation(plugin, items)
     local msg = head .. "\n" .. quote
     if item.note and item.note ~= "" then msg = msg .. "\n" .. DiscordAPI.cleanEmoji(item.note, true) end
     Club.send(plugin, club, msg:sub(1, 1900))
+end
+
+-- Reading sessions: from opening a book to closing it. Time asleep is not counted.
+
+Club.session = nil
+
+local function currentPage(plugin)
+    if plugin.current_page then return plugin.current_page end
+    local ok, page = pcall(function() return plugin.ui:getCurrentPage() end)
+    return ok and page or nil
+end
+
+--- Called when a book is opened.
+function Club.startSession(plugin)
+    local page = currentPage(plugin)
+    Club.session = {
+        start = os.time(),
+        asleep = 0,
+        pages = page and { [page] = true } or {},
+        count = 0,
+        start_pct = percent(plugin.ui, page),
+    }
+end
+
+--- Called on every page turn: counts the pages seen for the first time.
+function Club.trackPage(pageno)
+    local s = Club.session
+    if not s or not pageno or s.pages[pageno] then return end
+    s.pages[pageno] = true
+    s.count = s.count + 1
+end
+
+function Club.onSuspend()
+    if Club.session then Club.session.slept_at = os.time() end
+end
+
+function Club.onResume()
+    local s = Club.session
+    if s and s.slept_at then
+        s.asleep = s.asleep + math.max(0, os.time() - s.slept_at)
+        s.slept_at = nil
+    end
+end
+
+local function formatDuration(seconds)
+    local minutes = math.floor(seconds / 60 + 0.5)
+    if minutes < 60 then return string.format(_("%d min"), minutes) end
+    return string.format(_("%d h %02d min"), math.floor(minutes / 60), minutes % 60)
+end
+
+--- The summary of the current session, or nil if there is not much to tell.
+function Club.sessionSummary(plugin)
+    local s = Club.session
+    if not s then return nil end
+    local now = s.slept_at or os.time()
+    local seconds = now - s.start - s.asleep
+    if s.count == 0 or seconds < 60 then return nil end
+    local end_pct = percent(plugin.ui, currentPage(plugin))
+    local parts = {
+        formatDuration(seconds),
+        s.count == 1 and _("1 page") or string.format(_("%d pages"), s.count),
+    }
+    if s.start_pct and end_pct then
+        table.insert(parts, string.format("%d%% → %d%%", s.start_pct, end_pct))
+    end
+    return string.format(_("Reading session: **%s** — %s"), title(plugin.ui), table.concat(parts, " · "))
+end
+
+--- Called when the book is closed: posts the session summary if wanted.
+function Club.endSession(plugin)
+    local summary = Club.sessionSummary(plugin)
+    Club.session = nil
+    local club = Club.get(plugin.ui)
+    if not summary or not club.enabled or not club.summary or not club.channel then return end
+    if not club.summary_ask then
+        Club.send(plugin, club, summary)
+        return
+    end
+    local channel_title = club.channel.title or "?"
+    UIManager:show(ConfirmBox:new{
+        text = string.format(_("Post this to %s?"), channel_title) .. "\n\n" .. summary:gsub("%*%*", ""),
+        ok_text = _("Post"),
+        cancel_text = _("Not now"),
+        ok_callback = function() Club.send(plugin, club, summary) end,
+    })
 end
 
 --- Sends the current progress right now.
