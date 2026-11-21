@@ -311,6 +311,24 @@ function DiscordAPI:followThread(thread_id, follow)
     return self:delete(path)
 end
 
+-- Moderation
+
+--- Times a member out until `until_time` (unix seconds), or removes the timeout if nil.
+function DiscordAPI:timeoutMember(guild_id, user_id, until_time)
+    return self:patch("/guilds/" .. guild_id .. "/members/" .. user_id, {
+        communication_disabled_until = until_time and os.date("!%Y-%m-%dT%H:%M:%S.000Z", until_time) or rapidjson.null,
+    })
+end
+
+function DiscordAPI:kickMember(guild_id, user_id)
+    return self:delete("/guilds/" .. guild_id .. "/members/" .. user_id)
+end
+
+--- The latest entries of a server's audit log: ok, { audit_log_entries, users, ... }.
+function DiscordAPI:getAuditLog(guild_id, limit)
+    return self:get("/guilds/" .. guild_id .. "/audit-logs?limit=" .. (limit or 50))
+end
+
 --- Marks several channels as read at once. `entries` is a list of { channel_id, message_id }.
 function DiscordAPI:ackBulk(entries)
     for i = 1, #entries, 100 do
@@ -492,60 +510,77 @@ function DiscordAPI:openDM(user_id)
     return self:post("/users/@me/channels", { recipients = { user_id } })
 end
 
--- Permissions (only the low 32 bits matter for what we check)
+-- Permissions. Bit operations work on 32 bits, so the 64 bit values are kept as two
+-- halves: most checks only need the low one.
 
 local PERM_ADMINISTRATOR = 0x8
 local PERM_VIEW_CHANNEL = 0x400
 local PERM_SEND_MESSAGES = 0x800
 DiscordAPI.PERM_VIEW_CHANNEL = PERM_VIEW_CHANNEL
 DiscordAPI.PERM_SEND_MESSAGES = PERM_SEND_MESSAGES
+DiscordAPI.PERM_KICK_MEMBERS = 0x2
+DiscordAPI.PERM_VIEW_AUDIT_LOG = 0x80
+DiscordAPI.PERM_MANAGE_MESSAGES = 0x2000
+DiscordAPI.PERM_HI_MODERATE_MEMBERS = 0x100 -- 1 << 40, in the high half
 
 local function low32(v)
     v = tonumber(v) or 0
     return bit.tobit(v % 4294967296)
 end
 
---- Builds a function(channel) -> permission bits for the current user.
+local function high32(v)
+    v = tonumber(v) or 0
+    return bit.tobit(math.floor(v / 4294967296) % 4294967296)
+end
+
+--- Builds a function(channel) -> permission bits for the current user: the low 32 bits,
+-- and the high 32 bits as a second value.
 function DiscordAPI:permissionResolver(guild, member)
     local user_id = self.user and self.user.id
     local guild_id = guild.id
-    local roles_by_id = {}
+    local roles_lo, roles_hi = {}, {}
     for __, role in ipairs(guild.roles or {}) do
-        roles_by_id[role.id] = low32(role.permissions)
+        roles_lo[role.id] = low32(role.permissions)
+        roles_hi[role.id] = high32(role.permissions)
     end
     local member_roles = {}
-    local base = roles_by_id[guild_id] or 0
+    local base, base_hi = roles_lo[guild_id] or 0, roles_hi[guild_id] or 0
     for __, rid in ipairs(member.roles or {}) do
         member_roles[rid] = true
-        base = bit.bor(base, roles_by_id[rid] or 0)
+        base = bit.bor(base, roles_lo[rid] or 0)
+        base_hi = bit.bor(base_hi, roles_hi[rid] or 0)
     end
     local is_admin = guild.owner_id == user_id or bit.band(base, PERM_ADMINISTRATOR) ~= 0
 
-    return function(channel)
-        if is_admin then return bit.bnot(0) end
-        local perms = base
-        local ows = channel.permission_overwrites or {}
+    -- Applies the channel overwrites to one half of the permissions
+    local function apply(perms, ows, half)
         for __, ow in ipairs(ows) do
             if ow.id == guild_id then
-                perms = bit.band(perms, bit.bnot(low32(ow.deny)))
-                perms = bit.bor(perms, low32(ow.allow))
+                perms = bit.band(perms, bit.bnot(half(ow.deny)))
+                perms = bit.bor(perms, half(ow.allow))
             end
         end
         local allow, deny = 0, 0
         for __, ow in ipairs(ows) do
             if ow.type == 0 and member_roles[ow.id] then
-                allow = bit.bor(allow, low32(ow.allow))
-                deny = bit.bor(deny, low32(ow.deny))
+                allow = bit.bor(allow, half(ow.allow))
+                deny = bit.bor(deny, half(ow.deny))
             end
         end
         perms = bit.bor(bit.band(perms, bit.bnot(deny)), allow)
         for __, ow in ipairs(ows) do
             if ow.type == 1 and ow.id == user_id then
-                perms = bit.band(perms, bit.bnot(low32(ow.deny)))
-                perms = bit.bor(perms, low32(ow.allow))
+                perms = bit.band(perms, bit.bnot(half(ow.deny)))
+                perms = bit.bor(perms, half(ow.allow))
             end
         end
         return perms
+    end
+
+    return function(channel)
+        if is_admin then return bit.bnot(0), bit.bnot(0) end
+        local ows = channel and channel.permission_overwrites or {}
+        return apply(base, ows, low32), apply(base_hi, ows, high32)
     end
 end
 
@@ -609,6 +644,20 @@ function DiscordAPI.idBefore(id)
     digits[i] = digits[i] - 1
     local out = table.concat(digits):gsub("^0+", "")
     return out ~= "" and out or "0"
+end
+
+--- The moment (unix seconds) an id was created.
+function DiscordAPI.idTime(id)
+    -- id >> 22 without 64 bit integers: divide the decimal text by 4194304
+    local rest, quotient = 0, {}
+    for c in tostring(id or ""):gmatch("%d") do
+        rest = rest * 10 + tonumber(c)
+        table.insert(quotient, math.floor(rest / 4194304))
+        rest = rest % 4194304
+    end
+    local ms = tonumber(table.concat(quotient):gsub("^0+", "") or "0") or 0
+    if ms == 0 then return nil end
+    return math.floor((ms + 1420070400000) / 1000)
 end
 
 --- The smallest message id at a moment (unix seconds), for searching by date.

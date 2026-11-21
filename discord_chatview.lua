@@ -65,6 +65,15 @@ local function oneLine(text, max)
     return text
 end
 
+--- Drops the rows left out (nil) of a list of button rows.
+local function compactRows(rows)
+    local out = {}
+    for i = 1, table.maxn(rows) do
+        if rows[i] then table.insert(out, rows[i]) end
+    end
+    return out
+end
+
 --- Date and time of a future moment, short when it is today.
 local function formatWhen(t)
     if os.date("%Y-%m-%d", t) == os.date("%Y-%m-%d") then
@@ -2593,6 +2602,29 @@ function ChatView:messageActions(msg)
         end
         table.insert(buttons, row)
     end
+    if not mine and not self.offline and self.guild and msg.author then
+        local row = {}
+        if self:can(DiscordAPI.PERM_MANAGE_MESSAGES) then
+            table.insert(row, {
+                text = _("Delete (moderator)"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self:deleteAsModerator(msg)
+                end,
+            })
+        end
+        if not msg.webhook_id and (self:can(DiscordAPI.PERM_KICK_MEMBERS)
+                or self:can(DiscordAPI.PERM_HI_MODERATE_MEMBERS, true)) then
+            table.insert(row, {
+                text = _("Moderate author"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self:moderateMember(msg.author)
+                end,
+            })
+        end
+        if #row > 0 then table.insert(buttons, row) end
+    end
     if mine and not self.offline then
         table.insert(buttons, {
             {
@@ -2667,6 +2699,214 @@ function ChatView:editNote(user)
 end
 
 -- Threads
+
+-- Moderation (only offered with the matching permissions)
+
+--- Our permissions in this channel: low and high 32 bits (0, 0 outside servers).
+function ChatView:permissions()
+    if self._perms then return self._perms[1], self._perms[2] end
+    if not self.guild or self.offline then return 0, 0 end
+    local ch = self.channel
+    if THREAD_TYPES[ch.type] and ch.parent_id then ch = Gateway.channels[ch.parent_id] or ch end
+    local lo, hi = 0, 0
+    local gw_guild = Gateway.guilds[self.guild.id]
+    if gw_guild and gw_guild.roles and #gw_guild.roles > 0 then
+        lo, hi = Gateway:permissionResolver(gw_guild)(ch)
+    else
+        -- No real-time state: ask the server once
+        local ok_g, full = self.api:getGuild(self.guild.id)
+        local ok_m, member = self.api:getMyMember(self.guild.id)
+        if ok_g and ok_m and type(full) == "table" and type(member) == "table" then
+            if not (ch.permission_overwrites) then
+                local ok_c, full_ch = self.api:getChannel(ch.id)
+                if ok_c and type(full_ch) == "table" then ch = full_ch end
+            end
+            lo, hi = self.api:permissionResolver(full, member)(ch)
+        end
+    end
+    self._perms = { lo or 0, hi or 0 }
+    return self._perms[1], self._perms[2]
+end
+
+function ChatView:can(flag, high)
+    local lo, hi = self:permissions()
+    return DiscordAPI.hasPerm(high and hi or lo, flag)
+end
+
+function ChatView:deleteAsModerator(msg)
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Delete this message by %1?"), self:authorName(msg.author)) .. "\n\n" .. oneLine(self:renderContent(msg), 200),
+        ok_text = _("Delete"),
+        cancel_text = _("Cancel"),
+        ok_callback = function()
+            local ok, err = self.api:deleteMessage(self.channel.id, msg.id)
+            if ok then
+                self:removeMessage(msg.id)
+                self:redraw()
+            else
+                UIManager:show(InfoMessage:new{ text = _("Could not delete it: ") .. tostring(err) })
+            end
+        end,
+    })
+end
+
+local TIMEOUTS = {
+    { 60, _("60 seconds") }, { 300, _("5 minutes") }, { 600, _("10 minutes") },
+    { 3600, _("1 hour") }, { 86400, _("1 day") }, { 604800, _("1 week") },
+}
+
+--- Timeout and kick for the author of a message.
+function ChatView:moderateMember(user)
+    local name = self:authorName(user)
+    local dialog
+    local function done(ok, err, text)
+        if ok then
+            UIManager:show(Notification:new{ text = text })
+        else
+            UIManager:show(InfoMessage:new{ text = _("Could not do it: ") .. tostring(err) })
+        end
+    end
+    local buttons = {}
+    if self:can(DiscordAPI.PERM_HI_MODERATE_MEMBERS, true) then
+        local row = {}
+        for __, t in ipairs(TIMEOUTS) do
+            table.insert(row, {
+                text = t[2],
+                callback = function()
+                    UIManager:close(dialog)
+                    local ok, err = self.api:timeoutMember(self.guild.id, user.id, os.time() + t[1])
+                    done(ok, err, T(_("%1 is timed out for %2"), name, t[2]))
+                end,
+            })
+            if #row == 3 then
+                table.insert(buttons, row)
+                row = {}
+            end
+        end
+        table.insert(buttons, {{
+            text = _("Remove timeout"),
+            callback = function()
+                UIManager:close(dialog)
+                local ok, err = self.api:timeoutMember(self.guild.id, user.id, nil)
+                done(ok, err, T(_("Timeout removed for %1"), name))
+            end,
+        }})
+    end
+    if self:can(DiscordAPI.PERM_KICK_MEMBERS) then
+        table.insert(buttons, {{
+            text = T(_("Kick %1 from the server"), name),
+            callback = function()
+                UIManager:close(dialog)
+                UIManager:show(ConfirmBox:new{
+                    text = T(_("Kick %1 from the server? They can join again with an invite."), name),
+                    ok_text = _("Kick"),
+                    cancel_text = _("Cancel"),
+                    ok_callback = function()
+                        local ok, err = self.api:kickMember(self.guild.id, user.id)
+                        done(ok, err, T(_("%1 was kicked"), name))
+                    end,
+                })
+            end,
+        }})
+    end
+    dialog = ButtonDialog:new{
+        title = T(_("Moderate %1"), name) .. (self:can(DiscordAPI.PERM_HI_MODERATE_MEMBERS, true) and ("\n" .. _("Timeout:")) or ""),
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+local AUDIT_ACTIONS = {
+    [1] = _("updated the server"),
+    [10] = _("created a channel"), [11] = _("updated a channel"), [12] = _("deleted a channel"),
+    [13] = _("added channel permissions"), [14] = _("updated channel permissions"), [15] = _("removed channel permissions"),
+    [20] = _("kicked"), [21] = _("pruned members"), [22] = _("banned"), [23] = _("unbanned"),
+    [24] = _("updated member"), [25] = _("changed roles of"), [26] = _("moved in voice"), [27] = _("disconnected from voice"),
+    [28] = _("added a bot"),
+    [30] = _("created a role"), [31] = _("updated a role"), [32] = _("deleted a role"),
+    [40] = _("created an invite"), [41] = _("updated an invite"), [42] = _("deleted an invite"),
+    [50] = _("created a webhook"), [51] = _("updated a webhook"), [52] = _("deleted a webhook"),
+    [60] = _("added an emoji"), [61] = _("updated an emoji"), [62] = _("deleted an emoji"),
+    [72] = _("deleted a message of"), [73] = _("deleted messages in bulk"),
+    [74] = _("pinned a message of"), [75] = _("unpinned a message of"),
+    [110] = _("created a thread"), [111] = _("updated a thread"), [112] = _("deleted a thread"),
+    [140] = _("created an AutoMod rule"), [141] = _("updated an AutoMod rule"), [142] = _("deleted an AutoMod rule"),
+    [143] = _("AutoMod blocked a message of"),
+}
+
+--- One audit log entry as text: { line = summary, details = full text }.
+function ChatView:auditEntry(e, users)
+    local function userName(id)
+        local u = users[id]
+        return u and self:authorName(u) or id or "?"
+    end
+    local action = AUDIT_ACTIONS[e.action_type] or T(_("action %1"), e.action_type)
+    local changes = {}
+    for __, c in ipairs(e.changes or {}) do
+        if c.key == "communication_disabled_until" then
+            action = c.new_value and _("timed out") or _("removed the timeout of")
+        end
+        table.insert(changes, c.key .. ": " .. tostring(c.old_value ~= nil and rapidjson.encode(c.old_value) or "—")
+            .. " → " .. tostring(c.new_value ~= nil and rapidjson.encode(c.new_value) or "—"))
+    end
+    local target
+    if e.target_id then
+        if users[e.target_id] then
+            target = userName(e.target_id)
+        elseif Gateway.channels[e.target_id] and Gateway.channels[e.target_id].name then
+            target = "#" .. cleanEmoji(Gateway.channels[e.target_id].name, true)
+        end
+    end
+    local ms = DiscordAPI.idTime and DiscordAPI.idTime(e.id)
+    local when = ms and os.date("%Y-%m-%d %H:%M", ms) or ""
+    local line = userName(e.user_id) .. " " .. action .. (target and (" " .. target) or "")
+    if e.options and e.options.count then line = line .. " (" .. e.options.count .. ")" end
+    local details = { when, line }
+    if e.reason and e.reason ~= "" then table.insert(details, T(_("Reason: %1"), e.reason)) end
+    if #changes > 0 then
+        table.insert(details, "")
+        for __, c in ipairs(changes) do table.insert(details, c) end
+    end
+    return { line = line, when = when, details = table.concat(details, "\n") }
+end
+
+--- Read-only list of the latest audit log entries of this server.
+function ChatView:showAuditLog()
+    self.plugin:withLoading(_("Loading the audit log…"), function()
+        local ok, data = self.api:getAuditLog(self.guild.id, 50)
+        if not ok then
+            UIManager:show(InfoMessage:new{ text = _("Could not load the audit log: ") .. tostring(data) })
+            return
+        end
+        local users = {}
+        for __, u in ipairs(data.users or {}) do users[u.id] = u end
+        local items = {}
+        for __, e in ipairs(data.audit_log_entries or {}) do
+            local entry = self:auditEntry(e, users)
+            table.insert(items, { text = entry.line, mandatory = entry.when:sub(6), entry = entry })
+        end
+        if #items == 0 then
+            table.insert(items, { text = _("The audit log is empty."), select_enabled = false })
+        end
+        local menu
+        menu = Menu:new{
+            title = _("Audit log"),
+            item_table = items,
+            is_borderless = true,
+            is_popout = false,
+            covers_fullscreen = true,
+            items_max_lines = 2,
+            onMenuSelect = function(_menu, item)
+                if not item.entry then return true end
+                local TextViewer = require("ui/widget/textviewer")
+                UIManager:show(TextViewer:new{ title = _("Audit log"), text = item.entry.details })
+                return true
+            end,
+        }
+        menu.close_callback = function() UIManager:close(menu) end
+        UIManager:show(menu)
+    end)
+end
 
 --- Opens a thread of this channel.
 function ChatView:openThread(thread)
@@ -2752,7 +2992,7 @@ function ChatView:showMenu()
     local dialog
     local function close() UIManager:close(dialog) end
     dialog = ButtonDialog:new{
-        buttons = {
+        buttons = compactRows({
             {
                 {
                     text = _("Go to bottom"),
@@ -2834,6 +3074,12 @@ function ChatView:showMenu()
                     callback = function() close() self:toggleFollow() end,
                 } or nil,
             },
+            self.guild and not self.offline and self:can(DiscordAPI.PERM_VIEW_AUDIT_LOG) and {
+                {
+                    text = _("Audit log"),
+                    callback = function() close() self:showAuditLog() end,
+                },
+            } or nil,
             {
                 {
                     text = T(_("Pending messages (%1)"), #Outbox.list(self.channel.id)),
@@ -2888,7 +3134,7 @@ function ChatView:showMenu()
                     end,
                 },
             },
-        },
+        }),
     }
     UIManager:show(dialog)
 end
