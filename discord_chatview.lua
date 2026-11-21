@@ -330,9 +330,49 @@ function ChatView:authorName(user)
     return cleanEmoji(nick or user.global_name or user.username or "?")
 end
 
-function ChatView:renderContent(msg)
+--- Fenced code blocks of a text: { { lang, code } }, and the text with each block
+-- replaced by a placeholder ("\1" .. index .. "\1").
+local function extractCode(text)
+    local blocks = {}
+    text = text:gsub("```(.-)```", function(body)
+        local lang, code = body:match("^([%w_+#.-]*)\n(.*)$")
+        if not lang then lang, code = "", body end
+        code = code:gsub("^\n+", ""):gsub("%s+$", "")
+        table.insert(blocks, { lang = lang, code = code })
+        return "\1" .. #blocks .. "\1"
+    end)
+    return blocks, text
+end
+
+local SPOILER_CHAR = "░"
+local CODE_GUTTER = "│ "
+
+--- Code blocks of a message, forwarded messages included: { { lang, code } }.
+function ChatView.codeBlocks(msg)
+    local blocks = extractCode(msg.content or "")
+    for __, snap in ipairs(msg.message_snapshots or {}) do
+        if snap.message then
+            for __, b in ipairs(ChatView.codeBlocks(snap.message)) do table.insert(blocks, b) end
+        end
+    end
+    return blocks
+end
+
+--- True if the message has ||spoiler|| text.
+function ChatView.hasSpoilers(msg)
+    if (msg.content or ""):find("||.-||") then return true end
+    for __, snap in ipairs(msg.message_snapshots or {}) do
+        if snap.message and ChatView.hasSpoilers(snap.message) then return true end
+    end
+    return false
+end
+
+--- Renders the text of a message. Spoilers stay hidden unless `reveal` (or the message
+-- was revealed with a tap).
+function ChatView:renderContent(msg, reveal)
     if msg.deleted then return _("(deleted message)") end
-    local text = msg.content or ""
+    if reveal == nil then reveal = self.revealed and msg.id and self.revealed[msg.id] or false end
+    local code_blocks, text = extractCode(msg.content or "")
     local mentions = {}
     for __, u in ipairs(msg.mentions or {}) do
         mentions[u.id] = self:authorName(u)
@@ -357,18 +397,34 @@ function ChatView:renderContent(msg)
         end
         return os.date("%Y-%m-%d %H:%M", ts)
     end)
-    text = text:gsub("||(.-)||", "[spoiler: %1]")
+    text = text:gsub("||(.-)||", function(hidden)
+        if reveal then return "⟦" .. hidden .. "⟧" end
+        -- As many blocks as characters, so the length gives a hint like in Discord
+        local n = select(2, hidden:gsub("[^\128-\191]", ""))
+        return SPOILER_CHAR:rep(math.max(3, math.min(n, 30)))
+    end)
     text = text:gsub("%*%*(.-)%*%*", "%1")
     text = text:gsub("__(.-)__", "%1")
     text = text:gsub("~~(.-)~~", "%1")
-    text = text:gsub("```%w*\n?", "")
+    text = text:gsub("```%w*\n?", "") -- unclosed fence
     -- Markdown headings and subtext
     text = ("\n" .. text):gsub("\n%-?#+ ", "\n"):sub(2)
+    -- Code blocks: on their own lines, with a gutter. Tap them to read them in a monospace font.
+    text = text:gsub("\n?\1(%d+)\1\n?", function(i)
+        local b = code_blocks[tonumber(i)]
+        local lines = { "┌ " .. (b.lang ~= "" and T(_("code · %1"), b.lang) or _("code")) }
+        for line in (b.code .. "\n"):gmatch("(.-)\n") do
+            table.insert(lines, CODE_GUTTER .. line)
+        end
+        table.insert(lines, "└")
+        return "\n" .. table.concat(lines, "\n") .. "\n"
+    end)
+    text = text:gsub("^\n", ""):gsub("\n$", "")
 
     local extras = {}
     for __, snap in ipairs(msg.message_snapshots or {}) do
         if snap.message then
-            local fwd = self:renderContent(snap.message)
+            local fwd = self:renderContent(snap.message, reveal)
             table.insert(extras, "» " .. _("forwarded:") .. " " .. fwd:gsub("\n", "\n   "))
         end
     end
@@ -1106,7 +1162,7 @@ function ChatView:messageAt(pos)
     for __, sp in ipairs(self.spans) do
         if charpos >= sp.from and charpos <= sp.to then
             local on_reply = sp.reply_from and charpos >= sp.reply_from and charpos <= sp.reply_to
-            return sp.msg, on_reply and true or false
+            return sp.msg, on_reply and true or false, charpos
         end
     end
     return nil
@@ -1152,13 +1208,69 @@ function ChatView:goToReplied(msg)
     self:jumpTo(id)
 end
 
+--- What is under a character position of the chat text: "spoiler" for hidden spoiler
+-- text, "code" for a line of a code block, or nil.
+function ChatView:tapTarget(charpos)
+    local tw = self.scroll_widget and self.scroll_widget.text_widget
+    if not tw or not charpos or charpos < 1 then return nil end
+    -- Text from a little before the position up to it (characters, not bytes)
+    local from = math.max(1, charpos - 2000)
+    local before
+    if tw._xtext then
+        local ok, t = pcall(tw._xtext.getText, tw._xtext, from, charpos)
+        before = ok and t or nil
+    elseif type(tw.charlist) == "table" then
+        before = table.concat(tw.charlist, "", from, math.min(charpos, #tw.charlist))
+    end
+    if not before or before == "" then return nil end
+    if before:sub(-#SPOILER_CHAR) == SPOILER_CHAR then return "spoiler" end
+    local line = before:match("[^\n]*$")
+    if line:find("^" .. CODE_GUTTER) or line:find("^┌ ") or line == "└" then
+        return "code"
+    end
+end
+
+--- Shows the hidden spoiler text of a message.
+function ChatView:revealSpoilers(msg)
+    self.revealed = self.revealed or {}
+    self.revealed[msg.id] = true
+    self:redraw()
+end
+
+--- Shows the code blocks of a message in a monospace font.
+function ChatView:showCode(msg)
+    local blocks = ChatView.codeBlocks(msg)
+    if #blocks == 0 then return end
+    local parts = {}
+    for i, b in ipairs(blocks) do
+        local part = b.code
+        if #blocks > 1 or b.lang ~= "" then
+            part = "── " .. (b.lang ~= "" and b.lang or T(_("block %1"), i)) .. " ──\n" .. part
+        end
+        table.insert(parts, part)
+    end
+    local TextViewer = require("ui/widget/textviewer")
+    UIManager:show(TextViewer:new{
+        title = T(_("Code from %1"), self:authorName(msg.author)),
+        text = cleanEmoji(table.concat(parts, "\n\n")),
+        text_type = "code",
+    })
+end
+
 --- Tap on the text: the reply line jumps to the original message; the rest opens the
 -- message if enabled in the menu, otherwise turns the page.
 function ChatView:onTapMessage(arg, ges)
     if self:inTextArea(ges.pos) then
-        local msg, on_reply = self:messageAt(ges.pos)
+        local msg, on_reply, charpos = self:messageAt(ges.pos)
+        local target = msg and not on_reply and self:tapTarget(charpos)
         if msg and on_reply then
             self:goToReplied(msg)
+            return true
+        elseif target == "spoiler" then
+            self:revealSpoilers(msg)
+            return true
+        elseif target == "code" then
+            self:showCode(msg)
             return true
         elseif msg and self.settings.tap_actions then
             self:messageActions(msg)
@@ -2165,6 +2277,24 @@ function ChatView:messageActions(msg)
     if self.offline then
         -- Only reading actions make sense without network
         buttons = { buttons[2], { buttons[3][1] }, { buttons[4][1] }, save_row }
+    end
+    local has_spoilers = ChatView.hasSpoilers(msg) and not (self.revealed and self.revealed[msg.id])
+    local has_code = #ChatView.codeBlocks(msg) > 0
+    if has_spoilers or has_code then
+        local row = {}
+        if has_spoilers then
+            table.insert(row, { text = _("Show spoilers"), callback = function()
+                UIManager:close(dialog)
+                self:revealSpoilers(msg)
+            end })
+        end
+        if has_code then
+            table.insert(row, { text = _("View code"), callback = function()
+                UIManager:close(dialog)
+                self:showCode(msg)
+            end })
+        end
+        table.insert(buttons, 1, row)
     end
     if not self.offline then
         table.insert(buttons, {
