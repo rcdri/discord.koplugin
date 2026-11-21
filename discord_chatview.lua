@@ -811,6 +811,30 @@ function ChatView:markRead()
     end
 end
 
+--- Moves the read marker back so that `msg` and everything after it count as unread.
+function ChatView:markUnreadFrom(msg)
+    local prev_id
+    for i, m in ipairs(self.messages) do
+        if m.id == msg.id then
+            prev_id = self.messages[i - 1] and self.messages[i - 1].id
+            break
+        end
+    end
+    prev_id = prev_id or DiscordAPI.idBefore(msg.id)
+    local ok, err = self.api:ackMessage(self.channel.id, prev_id, true)
+    if not ok then
+        UIManager:show(InfoMessage:new{ text = _("Could not mark as unread: ") .. tostring(err) })
+        return
+    end
+    Gateway:markRead(self.channel.id, prev_id)
+    self.new_after = prev_id
+    -- Don't mark it read again until something new arrives
+    local last = self.messages[#self.messages]
+    self.acked_id = last and last.id
+    self:redraw()
+    UIManager:show(Notification:new{ text = _("Marked as unread") })
+end
+
 --- Fetches messages newer than the last one we have. Returns the number added.
 function ChatView:catchUp()
     local last = self.messages[#self.messages]
@@ -1980,6 +2004,17 @@ function ChatView:messageActions(msg)
     if self.offline then
         -- Only reading actions make sense without network
         buttons = { buttons[2], { buttons[3][1] }, { buttons[4][1] }, save_row }
+    end
+    if not self.offline then
+        table.insert(buttons, {
+            {
+                text = _("Mark unread from here"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self:markUnreadFrom(msg)
+                end,
+            },
+        })
     end
     if mine and not self.offline then
         table.insert(buttons, {

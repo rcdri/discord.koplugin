@@ -463,8 +463,11 @@ function DiscordAPI:deleteMessage(channel_id, message_id)
     return self:delete("/channels/" .. channel_id .. "/messages/" .. message_id)
 end
 
-function DiscordAPI:ackMessage(channel_id, message_id)
-    return self:post("/channels/" .. channel_id .. "/messages/" .. message_id .. "/ack", { token = rapidjson.null })
+--- Marks a channel read up to a message. With `manual`, the read marker may also move
+-- back (Discord's "Mark unread").
+function DiscordAPI:ackMessage(channel_id, message_id, manual)
+    local body = manual and { manual = true, mention_count = 0 } or { token = rapidjson.null }
+    return self:post("/channels/" .. channel_id .. "/messages/" .. message_id .. "/ack", body)
 end
 
 function DiscordAPI:openDM(user_id)
@@ -575,6 +578,21 @@ function DiscordAPI.cleanEmoji(text, strip)
 end
 
 --- Compares two snowflake ids given as strings.
+--- The id just before another one (snowflakes are decimal strings too big for numbers).
+function DiscordAPI.idBefore(id)
+    local digits = {}
+    for c in tostring(id):gmatch("%d") do table.insert(digits, tonumber(c)) end
+    local i = #digits
+    while i > 0 and digits[i] == 0 do
+        digits[i] = 9
+        i = i - 1
+    end
+    if i == 0 then return "0" end
+    digits[i] = digits[i] - 1
+    local out = table.concat(digits):gsub("^0+", "")
+    return out ~= "" and out or "0"
+end
+
 function DiscordAPI.idLess(a, b)
     -- ids are strings, but be tolerant with numbers (a decoder may turn them into numbers)
     a, b = tostring(a or "0"), tostring(b or "0")
