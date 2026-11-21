@@ -448,6 +448,7 @@ local function trimChannel(ch, guild_id)
         recipient_ids = ch.recipient_ids,
         recipients = ch.recipients,
         flags = v(ch.flags),
+        joined = (ch.member ~= nil and ch.member ~= rapidjson.null) or ch.joined or nil, -- following this thread
     }
 end
 
@@ -635,6 +636,7 @@ function Gateway:dispatch(t, d)
             end
         end
         local existed = self.channels[c.id]
+        if existed and c.joined == nil then c.joined = existed.joined end
         self.channels[c.id] = c
         local guild = c.guild_id and self.guilds[c.guild_id]
         if guild then
@@ -657,11 +659,30 @@ function Gateway:dispatch(t, d)
                 end
             end
         end
+    elseif t == "THREAD_MEMBER_UPDATE" then
+        -- Our own membership of a thread changed: we follow it
+        local c = self.channels[d.id]
+        if c then c.joined = true end
+    elseif t == "THREAD_MEMBERS_UPDATE" then
+        local c = self.channels[d.id]
+        local me = self.me and self.me.id
+        if c and me then
+            for _, m in ipairs(d.added_members or {}) do
+                if m.user_id == me then c.joined = true end
+            end
+            for _, uid in ipairs(d.removed_member_ids or {}) do
+                if uid == me then c.joined = nil end
+            end
+        end
     elseif t == "THREAD_LIST_SYNC" then
         local guild = self.guilds[d.guild_id]
         if guild then
+            local joined = {}
+            for _, m in ipairs(d.members or {}) do joined[m.id] = true end
             for _, th in ipairs(d.threads or {}) do
                 local c = trimChannel(th, d.guild_id)
+                local old_c = self.channels[c.id]
+                c.joined = joined[c.id] or c.joined or (old_c and old_c.joined) or nil
                 self.channels[c.id] = c
                 local found = false
                 for i, old in ipairs(guild.threads) do

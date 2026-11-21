@@ -9,6 +9,7 @@ Text first: no voice or video, and images only when you ask for them. Just your 
 **Navigation**
 - Servers with text, announcement and forum channels grouped by category; channels you can't see are hidden, read-only ones are marked
 - Threads under their channel, forum posts, and archived threads
+- **Start a thread** from any message, and **follow / unfollow** threads (followed ones are marked in the thread list)
 - Direct messages and group DMs, sorted by latest activity
 - **Unread markers** (bold + `●`) and **mention counts** (`@3`) for servers, channels and DMs, respecting muted servers and channels
 - **Favorites**: long-press a channel or DM to pin it to the top of the home screen
@@ -31,17 +32,24 @@ Text first: no voice or video, and images only when you ask for them. Just your 
 - **Send, reply, edit, delete**, copy, and open a DM with any author
 - **Reply without pinging**: an *@ on / @ off* switch when replying, like Discord's (remembered, also for queued messages)
 - **Offline send queue**: if there is no network, messages wait as *pending* (cancellable) and are sent automatically when the connection returns
+- **Send later**: schedule a message (in 30 minutes, 1 or 3 hours, tomorrow at 9:00 or at a chosen time) or keep it until the connection returns; scheduled messages can be sent now or cancelled from *Pending messages*
+- **Slash shortcuts**: `/shrug`, `/tableflip`, `/unflip`, `/lenny`, `/me` and `/spoiler` are expanded when sending
 - **Emoji by name**: search `:fire:`-style emojis, including each server's custom emojis, when writing and reacting; `:name:` typed by hand is converted when sending
 - **Hold a message** to open its actions directly (an option makes a tap do it too); **tap a reply line** to jump to the original message
 - **Live edits and deletions**: a deleted message stays as *(deleted message)* (its text can still be read) and the previous text of an edited one can be viewed
 - **Reactions**: shown under each message, add or remove them
 - **Quick replies** (configurable) and a **mention picker** with member search
 - **Pinned messages** and **search** within a channel, with "jump to message"
+- **Jump to a date or message**: open a long channel at the first message of a day, or at a message ID or link
 - **"New" separator** at the last read position when a channel has unread messages
+- **Mark unread from here**: move the read marker back to a message, so the channel shows as unread again
+- **Spoilers stay hidden** until you tap them, and **code blocks** keep their lines (tap one to read it in a monospace font)
+- **Attachments** show their kind, name and size; **text, PDF and e-book files** can be downloaded to a *Discord* folder in your home folder and opened in KOReader
 - **Polls** with live results, and voting
 - **Drafts** kept per channel, even across restarts
 - **Only messages for me**: a per-channel mode for busy channels
 - **Forward** messages, and keep **private notes** on users
+- **Moderation basics** for server staff, only shown with the matching permissions: delete other people's messages, time out or kick a member, and a read-only audit log
 - **Images on demand**: download a screen-sized version and open it in KOReader's image viewer — never loaded automatically
 - **Reading theme**: any font (including the Kindle's own), line spacing, margins and text size; **compact layout**
 - **Page turning** like a book: swipe left/right or use page-turn keys, with a periodic full refresh for e-ink
@@ -51,11 +59,12 @@ Text first: no voice or video, and images only when you ask for them. Just your 
 - **Notifications** for DMs and mentions while you read (optional background connection)
 - **Open as document**: read a long channel as a paginated book in KOReader's reader
 - **Send highlights** from a book to a chat (highlight menu → *Send to Discord*)
+- **Look up words** from a message (*View full*, then hold a word) in the dictionary or Wikipedia, and **send a definition or Wikipedia article** to a chat from the dictionary popup
 - **Offline chats**: the latest messages of recent chats are saved and readable without Wi-Fi
 - **Links as QR codes**, to open them on your phone
 - **Sleep screen summary** (optional): unread DMs and mentions shown on the sleep screen
 - **Share the current page** of the book you are reading, as a grayscale image, in a chat
-- **Book club** (per book, optional): send your reading progress (every X % or per chapter) and your highlights to a channel
+- **Book club** (per book, optional): send your reading progress (every X % or per chapter), your highlights and a **summary of each reading session** (time, pages, progress) to a channel
 - **Status bar counter** (optional): unread mentions and DMs in KOReader's status bar while you read
 - **Report a problem**: prepares a report (versions, device, recent Discord log lines, no token or private data) as a QR code with a pre-filled GitHub issue, and saves a copy to `discord-report.txt`
 - **Reading activity** (optional): your profile shows "Playing KOReader" with the book title, author and progress while a book is open
@@ -109,8 +118,8 @@ The interface follows KOReader's language, or the one chosen in *Discord → Set
 <!-- translations:start -->
 | Language | Code | Translated | Progress |
 | --- | --- | --- | --- |
-| English (source) | `en` | 401 / 401 | ![100 %](https://img.shields.io/badge/100%25-brightgreen) |
-| Español | `es` | 401 / 401 | ![100 %](https://img.shields.io/badge/100%25-brightgreen) |
+| English (source) | `en` | 544 / 544 | ![100 %](https://img.shields.io/badge/100%25-brightgreen) |
+| Español | `es` | 544 / 544 | ![100 %](https://img.shields.io/badge/100%25-brightgreen) |
 <!-- translations:end -->
 
 Want the plugin in your language, or spotted a wrong translation? No programming needed: see [CONTRIBUTING.md](CONTRIBUTING.md#translating-the-plugin), or open a [translation issue](../../issues/new?template=translation.yml).
