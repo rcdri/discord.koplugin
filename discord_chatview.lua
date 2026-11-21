@@ -2100,12 +2100,58 @@ function ChatView:jumpDialog()
     input:onShowKeyboard()
 end
 
+--- Looks up text in KOReader's dictionary, or in Wikipedia.
+function ChatView:lookUp(text, wikipedia)
+    local ui = self.plugin and self.plugin.ui
+    local Event = require("ui/event")
+    if wikipedia then
+        if ui and ui.wikipedia then
+            ui.wikipedia:onLookupWikipedia(text, false)
+        else
+            UIManager:sendEvent(Event:new("LookupWikipedia", text))
+        end
+    elseif ui and ui.dictionary then
+        ui.dictionary:onLookupWord(text, false)
+    else
+        UIManager:sendEvent(Event:new("LookupWord", text))
+    end
+end
+
+--- What to do with text selected in a message: look it up or copy it.
+function ChatView:selectionDialog(text)
+    local dialog
+    local row = {
+        { text = _("Dictionary"), callback = function() UIManager:close(dialog) self:lookUp(text) end },
+        { text = _("Wikipedia"), callback = function() UIManager:close(dialog) self:lookUp(text, true) end },
+    }
+    if Device:hasClipboard() then
+        table.insert(row, { text = _("Copy"), callback = function()
+            UIManager:close(dialog)
+            Device.input.setClipboardText(text)
+            UIManager:show(Notification:new{ text = _("Copied") })
+        end })
+    end
+    dialog = ButtonDialog:new{
+        title = oneLine(text, 80),
+        buttons = { row },
+    }
+    UIManager:show(dialog)
+end
+
+--- The whole message in a viewer, where words can be selected and looked up.
 function ChatView:viewFull(msg)
     local TextViewer = require("ui/widget/textviewer")
     UIManager:show(TextViewer:new{
         title = self:authorName(msg.author),
         text = self:renderContent(msg),
+        text_selection_callback = function(text)
+            if text and not text:match("^%s*$") then self:selectionDialog(text) end
+        end,
     })
+    if not self.settings.lookup_hint_shown then
+        self.settings.lookup_hint_shown = true
+        UIManager:show(Notification:new{ text = _("Hold a word to look it up. Hold and drag to select more.") })
+    end
 end
 
 -- Images
