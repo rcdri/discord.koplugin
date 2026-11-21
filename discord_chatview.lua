@@ -65,6 +65,14 @@ local function oneLine(text, max)
     return text
 end
 
+--- Date and time of a future moment, short when it is today.
+local function formatWhen(t)
+    if os.date("%Y-%m-%d", t) == os.date("%Y-%m-%d") then
+        return os.date("%H:%M", t)
+    end
+    return os.date("%Y-%m-%d %H:%M", t)
+end
+
 --- Inserts text, adding a space if it would stick to the previous word.
 local function insertText(input_dialog, text)
     local current = input_dialog:getInputText()
@@ -106,6 +114,8 @@ local ChatView = InputContainer:extend{
     around_id = nil,     -- open centered on this message instead of the latest ones
     offline = false,     -- showing cached messages without network
 }
+
+ChatView.formatWhen = formatWhen
 
 local CACHE_KEEP = 30 -- channels kept in the offline cache
 
@@ -529,7 +539,14 @@ function ChatView:buildText()
         if not compact then table.insert(out, "") end
         table.insert(out, "───── " .. _("Pending") .. " ─────")
         for __, e in ipairs(pending) do
-            local head = os.date("%H:%M", e.time) .. " " .. (e.error and ("⚠ " .. _("not sent") .. ": " .. e.error) or ("⏳ " .. _("pending")))
+            local head
+            if e.error then
+                head = os.date("%H:%M", e.time) .. " ⚠ " .. _("not sent") .. ": " .. e.error
+            elseif Outbox.isWaiting(e) then
+                head = "🕓 " .. T(_("scheduled for %1"), ChatView.formatWhen(e.send_at))
+            else
+                head = os.date("%H:%M", e.time) .. " ⏳ " .. _("pending")
+            end
             table.insert(out, head)
             table.insert(out, e.content)
         end
@@ -1163,8 +1180,11 @@ end
 
 --- Sends queued messages when the network is back; refreshes this chat if needed.
 function ChatView:flushOutbox()
-    if self.offline or Outbox.count() == 0 or not NetworkMgr:isOnline() then return end
-    local had_here = #Outbox.list(self.channel.id) > 0
+    if self.offline or Outbox.countDue() == 0 or not NetworkMgr:isOnline() then return end
+    local had_here = false
+    for __, e in ipairs(Outbox.list(self.channel.id)) do
+        if not e.error and not Outbox.isWaiting(e) then had_here = true end
+    end
     local sent = Outbox.flush(self.api)
     if #sent > 0 or had_here then
         local mine = {}
@@ -1184,7 +1204,9 @@ function ChatView:showPending()
         for __, e in ipairs(Outbox.list(self.channel.id)) do
             table.insert(items, {
                 text = oneLine(e.content, 120),
-                mandatory = e.error and _("not sent") or os.date("%H:%M", e.time),
+                mandatory = e.error and _("not sent")
+                    or (Outbox.isWaiting(e) and ChatView.formatWhen(e.send_at))
+                    or os.date("%H:%M", e.time),
                 entry = e,
             })
         end
@@ -1203,6 +1225,35 @@ function ChatView:showPending()
         onMenuSelect = function(_menu, item)
             local e = item.entry
             if not e then return true end
+            if Outbox.isWaiting(e) then
+                local choice
+                choice = ButtonDialog:new{
+                    title = T(_("Scheduled for %1"), formatWhen(e.send_at)) .. "\n\n" .. oneLine(e.content, 200),
+                    buttons = {{
+                        {
+                            text = _("Cancel message"),
+                            callback = function()
+                                UIManager:close(choice)
+                                Outbox.remove(e.id)
+                                menu:switchItemTable(_("Pending messages"), fill())
+                                self:redraw()
+                            end,
+                        },
+                        {
+                            text = _("Send now"),
+                            callback = function()
+                                UIManager:close(choice)
+                                Outbox.makeDue(e.id)
+                                menu:switchItemTable(_("Pending messages"), fill())
+                                self:flushOutbox()
+                                self:redraw()
+                            end,
+                        },
+                    }},
+                }
+                UIManager:show(choice)
+                return true
+            end
             UIManager:show(ConfirmBox:new{
                 text = _("Cancel this pending message?") .. "\n\n" .. oneLine(e.content, 200),
                 ok_text = _("Cancel message"),
@@ -1290,13 +1341,26 @@ function ChatView:compose(prefill, edit_msg)
             self:send(text, edit_msg)
         end,
     })
+    local buttons = { row }
+    if not edit_msg then
+        table.insert(buttons, {{
+            text = _("Send later…"),
+            callback = function()
+                local text = dialog:getInputText()
+                if text:match("^%s*$") then return end
+                self:sendLaterDialog(text, function()
+                    UIManager:close(dialog)
+                end)
+            end,
+        }})
+    end
     dialog = InputDialog:new{
         title = title,
         description = self.reply_to and not edit_msg and oneLine(self:renderContent(self.reply_to), 80) or nil,
         input = prefill or self:getDraft() or "",
         allow_newline = true,
         text_height = Screen:scaleBySize(120),
-        buttons = { row },
+        buttons = buttons,
         edited_callback = not edit_msg and function() self:sendTyping() end or nil,
     }
     UIManager:show(dialog)
@@ -1362,6 +1426,80 @@ function ChatView:send(text, edit_msg)
     self:addMessages({ data })
     self:redraw("bottom")
     self:markRead()
+end
+
+--- Queues `text` to be sent at `send_at` (unix time), or when the connection returns if nil.
+function ChatView:sendLater(text, send_at)
+    Outbox.add(self.channel.id, self:applyMentions(text), self:replyRef(), send_at)
+    self:setDraft(nil)
+    self.reply_to = nil
+    self:redraw("bottom")
+    self.plugin:scheduleOutbox()
+    UIManager:show(Notification:new{
+        text = send_at and T(_("Scheduled for %1"), formatWhen(send_at))
+            or _("The message will be sent when the connection returns."),
+    })
+end
+
+--- Asks when to send `text`. on_done is called once it is queued.
+function ChatView:sendLaterDialog(text, on_done)
+    local dialog
+    local function pick(send_at)
+        UIManager:close(dialog)
+        on_done()
+        self:sendLater(text, send_at)
+    end
+    local now = os.time()
+    local tomorrow = os.date("*t", now + 86400)
+    tomorrow.hour, tomorrow.min, tomorrow.sec = 9, 0, 0
+    dialog = ButtonDialog:new{
+        title = _("Send later"),
+        buttons = {
+            {
+                { text = _("In 30 minutes"), callback = function() pick(now + 1800) end },
+                { text = _("In 1 hour"), callback = function() pick(now + 3600) end },
+            },
+            {
+                { text = _("In 3 hours"), callback = function() pick(now + 3 * 3600) end },
+                { text = _("Tomorrow at 9:00"), callback = function() pick(os.time(tomorrow)) end },
+            },
+            {
+                {
+                    text = _("At a time…"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        local DateTimeWidget = require("ui/widget/datetimewidget")
+                        local t = os.date("*t", now + 3600)
+                        UIManager:show(DateTimeWidget:new{
+                            hour = t.hour,
+                            min = 0,
+                            ok_text = _("Schedule"),
+                            title_text = _("Send at"),
+                            info_text = _("If the time has already passed today, it is sent tomorrow."),
+                            callback = function(time)
+                                local at = os.date("*t")
+                                at.hour, at.min, at.sec = time.hour, time.min, 0
+                                local send_at = os.time(at)
+                                if send_at <= os.time() then
+                                    at.day = at.day + 1
+                                    send_at = os.time(at)
+                                end
+                                on_done()
+                                self:sendLater(text, send_at)
+                            end,
+                        })
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("When the connection returns"),
+                    callback = function() pick(nil) end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
 end
 
 function ChatView:pickQuickReply(input_dialog)
