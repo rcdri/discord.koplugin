@@ -2647,12 +2647,16 @@ function Discord:openAsDocument(view)
         end
         f:write(table.concat(html, "\n"))
         f:close()
-        -- Close Discord screens, then open the document in the reader
-        for i = #shared.views, 1, -1 do UIManager:close(shared.views[i]) end
-        for i = #shared.lists, 1, -1 do UIManager:close(shared.lists[i]) end
-        UIManager:nextTick(function()
-            require("apps/reader/readerui"):showReader(path)
-        end)
+        self:openDocument(path)
+    end)
+end
+
+--- Closes the Discord screens and opens a file in the reader.
+function Discord:openDocument(path)
+    for i = #shared.views, 1, -1 do UIManager:close(shared.views[i]) end
+    for i = #shared.lists, 1, -1 do UIManager:close(shared.lists[i]) end
+    UIManager:nextTick(function()
+        require("apps/reader/readerui"):showReader(path)
     end)
 end
 

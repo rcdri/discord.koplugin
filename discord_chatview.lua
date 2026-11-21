@@ -358,6 +358,60 @@ function ChatView.codeBlocks(msg)
     return blocks
 end
 
+local EBOOK_EXT = { epub = true, mobi = true, azw = true, azw3 = true, fb2 = true, djvu = true, djv = true,
+    cbz = true, cbt = true, cbr = true, kepub = true, prc = true, pdb = true, xps = true, oxps = true, chm = true }
+local TEXT_EXT = { txt = true, md = true, log = true, csv = true, json = true, xml = true, html = true, htm = true,
+    rtf = true, doc = true, docx = true, odt = true }
+
+--- Human readable file size.
+function ChatView.formatSize(bytes)
+    if not bytes then return nil end
+    if bytes < 1024 then return T(_("%1 B"), bytes) end
+    if bytes < 1024 * 1024 then return T(_("%1 KB"), math.floor(bytes / 1024 + 0.5)) end
+    return T(_("%1 MB"), string.format("%.1f", bytes / (1024 * 1024)))
+end
+
+--- Kind of an attachment: "image", "video", "audio", "pdf", "ebook", "text" or "file".
+function ChatView.attachmentKind(a)
+    local ctype = (a.content_type or ""):lower()
+    local ext = ((a.filename or ""):match("%.([%w]+)$") or ""):lower()
+    if ctype:match("^image/") then return "image" end
+    if ctype:match("^video/") then return "video" end
+    if ctype:match("^audio/") then return "audio" end
+    if ext == "pdf" or ctype == "application/pdf" then return "pdf" end
+    if EBOOK_EXT[ext] or ctype == "application/epub+zip" then return "ebook" end
+    if TEXT_EXT[ext] or ctype:match("^text/") then return "text" end
+    return "file"
+end
+
+local KIND_LABELS = {
+    image = _("image"), video = _("video"), audio = _("audio"), pdf = _("PDF"),
+    ebook = _("e-book"), text = _("text"), file = _("file"),
+}
+
+--- One line describing an attachment: kind, name and size.
+function ChatView.attachmentLine(a)
+    local parts = { a.filename or "?" }
+    local size = ChatView.formatSize(a.size)
+    if size then table.insert(parts, size) end
+    return "[" .. KIND_LABELS[ChatView.attachmentKind(a)] .. ": " .. table.concat(parts, " · ") .. "]"
+end
+
+--- Attachments that KOReader can open as documents (text, PDF, e-books).
+function ChatView.documentsOf(msg)
+    local list = {}
+    local ok, DocumentRegistry = pcall(require, "document/documentregistry")
+    for __, a in ipairs(msg.attachments or {}) do
+        local kind = ChatView.attachmentKind(a)
+        local readable = kind == "pdf" or kind == "ebook" or kind == "text"
+        if readable and ok and a.filename and not DocumentRegistry:hasProvider(a.filename) then
+            readable = false -- e.g. .docx without a provider
+        end
+        if readable and a.url then table.insert(list, a) end
+    end
+    return list
+end
+
 --- True if the message has ||spoiler|| text.
 function ChatView.hasSpoilers(msg)
     if (msg.content or ""):find("||.-||") then return true end
@@ -429,8 +483,7 @@ function ChatView:renderContent(msg, reveal)
         end
     end
     for __, a in ipairs(msg.attachments or {}) do
-        local kind = (a.content_type or ""):match("^image/") and _("image") or _("file")
-        table.insert(extras, "[" .. kind .. ": " .. (a.filename or "?") .. "]")
+        table.insert(extras, ChatView.attachmentLine(a))
     end
     for __, s in ipairs(msg.sticker_items or {}) do
         table.insert(extras, "[sticker: " .. (s.name or "?") .. "]")
@@ -1228,6 +1281,75 @@ function ChatView:tapTarget(charpos)
     if line:find("^" .. CODE_GUTTER) or line:find("^┌ ") or line == "└" then
         return "code"
     end
+end
+
+--- Folder where downloaded files are saved: "Discord" in KOReader's home folder.
+function ChatView.downloadDir()
+    local fmu = require("apps/filemanager/filemanagerutil")
+    local home = (fmu.getHomeFolder and fmu.getHomeFolder()) or G_reader_settings:readSetting("home_dir")
+        or Device.home_dir or DataStorage:getDataDir()
+    local dir = home:gsub("/$", "") .. "/Discord"
+    if lfs.attributes(dir, "mode") ~= "directory" then lfs.mkdir(dir) end
+    return dir
+end
+
+--- Downloads an attachment to the documents folder and offers to open it.
+function ChatView:downloadFile(a)
+    local dir = ChatView.downloadDir()
+    local name = (a.filename or "file"):gsub("[/\\:*?\"<>|%c]", "_")
+    local path = dir .. "/" .. name
+    local existing = lfs.attributes(path)
+    if existing and a.size and existing.size ~= a.size then
+        -- Another file with the same name: keep both
+        local base, ext = name:match("^(.-)(%.[^.]*)$")
+        if not base then base, ext = name, "" end
+        local n = 2
+        repeat
+            path = dir .. "/" .. base .. " (" .. n .. ")" .. ext
+            n = n + 1
+        until not lfs.attributes(path)
+        existing = nil
+    end
+    local function offerOpen()
+        UIManager:show(ConfirmBox:new{
+            text = T(_("Saved to %1\n\nOpen it now?"), path),
+            ok_text = _("Open"),
+            cancel_text = _("Later"),
+            ok_callback = function() self.plugin:openDocument(path) end,
+        })
+    end
+    if existing then
+        offerOpen()
+        return
+    end
+    self.plugin:withLoading(T(_("Downloading %1…"), name), function()
+        local ok, err = self.api:download(a.url, path)
+        if not ok then
+            UIManager:show(InfoMessage:new{ text = _("Could not download the file: ") .. tostring(err) })
+            return
+        end
+        offerOpen()
+    end)
+end
+
+function ChatView:downloadFiles(files)
+    if #files == 1 then
+        self:downloadFile(files[1])
+        return
+    end
+    local dialog
+    local buttons = {}
+    for __, a in ipairs(files) do
+        table.insert(buttons, {{
+            text = a.filename .. (a.size and (" (" .. ChatView.formatSize(a.size) .. ")") or ""),
+            callback = function()
+                UIManager:close(dialog)
+                self:downloadFile(a)
+            end,
+        }})
+    end
+    dialog = ButtonDialog:new{ title = _("Download to the documents folder"), buttons = buttons }
+    UIManager:show(dialog)
 end
 
 --- Shows the hidden spoiler text of a message.
@@ -2277,6 +2399,18 @@ function ChatView:messageActions(msg)
     if self.offline then
         -- Only reading actions make sense without network
         buttons = { buttons[2], { buttons[3][1] }, { buttons[4][1] }, save_row }
+    end
+    local files = not self.offline and ChatView.documentsOf(msg) or {}
+    if #files > 0 then
+        local a = files[1]
+        table.insert(buttons, 1, {{
+            text = #files == 1 and T(_("Download %1"), a.filename .. (a.size and (" (" .. ChatView.formatSize(a.size) .. ")") or ""))
+                or T(_("Download files (%1)"), #files),
+            callback = function()
+                UIManager:close(dialog)
+                self:downloadFiles(files)
+            end,
+        }})
     end
     local has_spoilers = ChatView.hasSpoilers(msg) and not (self.revealed and self.revealed[msg.id])
     local has_code = #ChatView.codeBlocks(msg) > 0
