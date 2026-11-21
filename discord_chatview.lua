@@ -2431,7 +2431,7 @@ function ChatView:messageActions(msg)
         table.insert(buttons, 1, row)
     end
     if not self.offline then
-        table.insert(buttons, {
+        local row = {
             {
                 text = _("Mark unread from here"),
                 callback = function()
@@ -2439,7 +2439,28 @@ function ChatView:messageActions(msg)
                     self:markUnreadFrom(msg)
                 end,
             },
-        })
+        }
+        if self.guild and not THREAD_TYPES[self.channel.type] then
+            if msg.thread then
+                table.insert(row, {
+                    text = _("Open thread"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:openThread(msg.thread)
+                    end,
+                })
+            else
+                table.insert(row, {
+                    text = _("Start thread"),
+                    enabled = self.can_send and not SYSTEM_TYPES[msg.type],
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:startThread(msg)
+                    end,
+                })
+            end
+        end
+        table.insert(buttons, row)
     end
     if mine and not self.offline then
         table.insert(buttons, {
@@ -2515,6 +2536,80 @@ function ChatView:editNote(user)
 end
 
 -- Threads
+
+--- Opens a thread of this channel.
+function ChatView:openThread(thread)
+    local th = Gateway.channels[thread.id] or thread
+    local guild_name = cleanEmoji(self.guild.name or "", true)
+    local parent = cleanEmoji(self.channel.name or "", true)
+    local name = cleanEmoji(th.name or "?", true)
+    self.channel_names = self.channel_names or {}
+    self.channel_names[th.id] = th.name
+    local archived = th.thread_metadata and th.thread_metadata.archived
+    self.plugin:openChannel(th, self.guild, name, guild_name .. " › #" .. parent, self.channel_names, not archived)
+end
+
+--- Asks for a name and starts a thread from a message.
+function ChatView:startThread(msg)
+    local default = oneLine((msg.content or ""):gsub("<[^>]+>", ""):gsub("[*_~|`]", ""), 80)
+    if default:match("^%s*$") then default = T(_("Thread of %1"), self:authorName(msg.author)) end
+    local input
+    input = InputDialog:new{
+        title = _("Start thread"),
+        description = oneLine(self:renderContent(msg), 80),
+        input = default,
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(input) end },
+            {
+                text = _("Start"),
+                is_enter_default = true,
+                callback = function()
+                    local name = input:getInputText():gsub("^%s+", ""):gsub("%s+$", "")
+                    if name == "" then return end
+                    UIManager:close(input)
+                    self.plugin:withLoading(_("Starting thread…"), function()
+                        local util_chars = util.splitToChars(name)
+                        if #util_chars > 100 then name = table.concat(util_chars, "", 1, 100) end
+                        local ok, th = self.api:startThread(self.channel.id, msg.id, name)
+                        if not ok then
+                            UIManager:show(InfoMessage:new{ text = _("Could not start the thread: ") .. tostring(th) })
+                            return
+                        end
+                        th.joined = true -- the author follows it
+                        th.guild_id = th.guild_id or self.guild.id
+                        Gateway.channels[th.id] = Gateway.channels[th.id] or th
+                        Gateway.channels[th.id].joined = true
+                        msg.thread = th
+                        self:openThread(th)
+                    end)
+                end,
+            },
+        }},
+    }
+    UIManager:show(input)
+    input:onShowKeyboard()
+end
+
+--- True if we follow the thread shown in this view.
+function ChatView:isFollowing()
+    local c = Gateway.channels[self.channel.id]
+    return (c and c.joined) or self.channel.joined or false
+end
+
+function ChatView:toggleFollow()
+    local follow = not self:isFollowing()
+    local ok, err = self.api:followThread(self.channel.id, follow)
+    if not ok then
+        UIManager:show(InfoMessage:new{ text = _("Could not change it: ") .. tostring(err) })
+        return
+    end
+    local c = Gateway.channels[self.channel.id]
+    if c then c.joined = follow or nil end
+    self.channel.joined = follow or nil
+    UIManager:show(Notification:new{
+        text = follow and _("Following this thread") or _("No longer following this thread"),
+    })
+end
 
 function ChatView:showThreads()
     local parent_id = THREAD_TYPES[self.channel.type] and self.channel.parent_id or self.channel.id
@@ -2595,6 +2690,11 @@ function ChatView:showMenu()
                     enabled = not self.offline,
                     callback = function() close() require("discord_members").show(self.plugin, self) end,
                 },
+                THREAD_TYPES[self.channel.type] and {
+                    text = self:isFollowing() and _("Unfollow thread") or _("Follow thread"),
+                    enabled = not self.offline,
+                    callback = function() close() self:toggleFollow() end,
+                } or nil,
             },
             {
                 {

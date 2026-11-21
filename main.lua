@@ -2571,7 +2571,9 @@ function Discord:openThreadList(parent_id, guild, channel_names)
                 table.insert(items, {
                     text = name,
                     bold = bold,
-                    mandatory = mark or (archived and _("archived")) or nil,
+                    mandatory = mark or (archived and _("archived"))
+                        or ((th.joined or (Gateway.channels[th.id] and Gateway.channels[th.id].joined)) and _("following"))
+                        or nil,
                     callback = function()
                         self:openChannel(th, guild, name, guild_name .. " › #" .. parent_name, channel_names,
                             not archived)

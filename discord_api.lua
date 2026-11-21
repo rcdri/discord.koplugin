@@ -71,6 +71,8 @@ function DiscordAPI:request(method, path, body, no_auth, retried)
         headers["Content-Type"] = "application/json"
         headers["Content-Length"] = tostring(#payload)
         source = ltn12.source.string(payload)
+    elseif method == "PUT" then
+        headers["Content-Length"] = "0"
     end
     socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
     local code, resp_headers, status = socket.skip(1, http.request(Net.prepare{
@@ -119,6 +121,7 @@ function DiscordAPI:get(path) return self:request("GET", path) end
 function DiscordAPI:post(path, body) return self:request("POST", path, body or {}) end
 function DiscordAPI:patch(path, body) return self:request("PATCH", path, body or {}) end
 function DiscordAPI:delete(path) return self:request("DELETE", path) end
+function DiscordAPI:put(path, body) return self:request("PUT", path, body) end
 
 -- Authentication
 
@@ -291,6 +294,21 @@ function DiscordAPI:getArchivedThreads(channel_id)
     local ok, data = self:get("/channels/" .. channel_id .. "/threads/archived/public?limit=25")
     if not ok then return false, data end
     return true, data.threads or {}
+end
+
+--- Starts a thread from a message. Returns ok, thread channel.
+function DiscordAPI:startThread(channel_id, message_id, name)
+    return self:post("/channels/" .. channel_id .. "/messages/" .. message_id .. "/threads", {
+        name = name,
+        auto_archive_duration = 1440,
+    })
+end
+
+--- Follows (joins) or unfollows (leaves) a thread.
+function DiscordAPI:followThread(thread_id, follow)
+    local path = "/channels/" .. thread_id .. "/thread-members/@me"
+    if follow then return self:put(path) end
+    return self:delete(path)
 end
 
 --- Marks several channels as read at once. `entries` is a list of { channel_id, message_id }.
