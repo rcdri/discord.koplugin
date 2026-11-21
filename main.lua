@@ -113,6 +113,9 @@ function Discord:init()
     if self.ui.highlight then
         self:addToHighlightDialog()
     end
+    if self.ui.dictionary and self.ui.dictionary.addToDictButtons then
+        self:addToDictButtons()
+    end
     self:setupGatewayListeners()
     self:scheduleOutbox()
     if self:wantsBackgroundConnection() and Gateway.state == "disconnected" then
@@ -2679,6 +2682,76 @@ function Discord:addToHighlightDialog()
     end)
 end
 
+--- "Send to Discord" in the dictionary and Wikipedia popups.
+function Discord:addToDictButtons()
+    self.ui.dictionary:addToDictButtons({
+        id = "discord_send",
+        text = _("Send to Discord"),
+        conditional = true,
+        show_func = function() return self:isLoggedIn() end,
+        callback = function(dict_popup) self:shareLookup(dict_popup) end,
+    })
+end
+
+--- Older KOReader versions build the popup buttons with this event instead.
+function Discord:onDictButtonsReady(dict_popup, buttons)
+    if self.ui.dictionary and self.ui.dictionary.addToDictButtons then return end
+    if not self:isLoggedIn() then return end
+    table.insert(buttons, {{
+        id = "discord_send",
+        text = _("Send to Discord"),
+        callback = function() self:shareLookup(dict_popup) end,
+    }})
+end
+
+local function truncateChars(text, max)
+    local chars = util.splitToChars(text)
+    if #chars <= max then return text end
+    return util.trim(table.concat(chars, "", 1, max)) .. "…"
+end
+
+--- The message to send for what a dictionary or Wikipedia popup shows.
+function Discord.lookupMessage(dict_popup)
+    local r = dict_popup.results and dict_popup.results[dict_popup.dict_index or 1] or {}
+    local word = util.trim(r.word or dict_popup.lookupword or dict_popup.word or "")
+    local definition = r.definition or dict_popup.definition or ""
+    if r.is_html or dict_popup.is_html then definition = util.htmlToPlainText(definition) end
+    definition = util.trim((definition:gsub("\n%s*\n+", "\n")))
+    if dict_popup.is_wiki then
+        local lang = (r.lang or dict_popup.lang or "en"):lower()
+        local title = word:gsub(" ", "_")
+        local url = "https://" .. lang .. ".wikipedia.org/wiki/"
+            .. title:gsub("[^%w%-_.~()/:,'\128-\255]", function(c) return string.format("%%%02X", c:byte()) end)
+        local summary = definition:match("^[^\n]+") or ""
+        local text = "**" .. word .. "**"
+        if summary ~= "" and summary ~= word then text = text .. " — " .. truncateChars(summary, 300) end
+        return text .. "\n" .. url
+    end
+    local text = "**" .. word .. "**"
+    if r.dict and r.dict ~= "" then text = text .. " (*" .. r.dict .. "*)" end
+    return text .. "\n" .. truncateChars(definition, 1700)
+end
+
+--- Sends the current dictionary or Wikipedia result to a chat.
+function Discord:shareLookup(dict_popup)
+    local text = Discord.lookupMessage(dict_popup)
+    self:pickDestination(dict_popup.is_wiki and _("Send article to…") or _("Send definition to…"), function(e)
+        self:sendTo(e, text)
+    end)
+end
+
+--- Sends a message to a favorite or recent chat, with feedback.
+function Discord:sendTo(e, text)
+    self:withLoading(_("Sending…"), function()
+        local ok, err = self.api:sendMessage(e.id, text)
+        if ok then
+            UIManager:show(Notification:new{ text = T(_("Sent to %1"), e.title or "?") })
+        else
+            UIManager:show(InfoMessage:new{ text = _("Could not send: ") .. tostring(err) })
+        end
+    end)
+end
+
 function Discord:shareText(text)
     local props = self.ui.doc_props or {}
     local book = props.display_title or props.title
@@ -2687,14 +2760,7 @@ function Discord:shareText(text)
         quoted = quoted .. "\n— *" .. book .. "*"
     end
     self:pickDestination(_("Send highlight to…"), function(e)
-        self:withLoading(_("Sending…"), function()
-            local ok, err = self.api:sendMessage(e.id, quoted)
-            if ok then
-                UIManager:show(Notification:new{ text = T(_("Sent to %1"), e.title or "?") })
-            else
-                UIManager:show(InfoMessage:new{ text = _("Could not send: ") .. tostring(err) })
-            end
-        end)
+        self:sendTo(e, quoted)
     end)
 end
 
