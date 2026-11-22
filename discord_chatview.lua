@@ -65,6 +65,23 @@ local function oneLine(text, max)
     return text
 end
 
+--- Drops the rows left out (nil) of a list of button rows.
+local function compactRows(rows)
+    local out = {}
+    for i = 1, table.maxn(rows) do
+        if rows[i] then table.insert(out, rows[i]) end
+    end
+    return out
+end
+
+--- Date and time of a future moment, short when it is today.
+local function formatWhen(t)
+    if os.date("%Y-%m-%d", t) == os.date("%Y-%m-%d") then
+        return os.date("%H:%M", t)
+    end
+    return os.date("%Y-%m-%d %H:%M", t)
+end
+
 --- Inserts text, adding a space if it would stick to the previous word.
 local function insertText(input_dialog, text)
     local current = input_dialog:getInputText()
@@ -106,6 +123,29 @@ local ChatView = InputContainer:extend{
     around_id = nil,     -- open centered on this message instead of the latest ones
     offline = false,     -- showing cached messages without network
 }
+
+ChatView.formatWhen = formatWhen
+
+-- Shortcuts typed at the start of a message, expanded before sending like Discord does.
+-- Each returns the message to send from the text that follows the command.
+local SHORTCUTS = {
+    shrug = function(rest) return (rest ~= "" and rest .. " " or "") .. "¯\\_(ツ)_/¯" end,
+    tableflip = function(rest) return (rest ~= "" and rest .. " " or "") .. "(╯°□°)╯︵ ┻━┻" end,
+    unflip = function(rest) return (rest ~= "" and rest .. " " or "") .. "┬─┬ノ( º _ ºノ)" end,
+    lenny = function(rest) return (rest ~= "" and rest .. " " or "") .. "( ͡° ͜ʖ ͡°)" end,
+    me = function(rest) return rest ~= "" and ("_" .. rest .. "_") or nil end,
+    spoiler = function(rest) return rest ~= "" and ("||" .. rest .. "||") or nil end,
+}
+
+--- Expands /shrug, /me, /spoiler and friends. Other text is returned unchanged.
+function ChatView.expandShortcuts(text)
+    local name, rest = text:match("^/(%a+)%s*(.-)%s*$")
+    local expand = name and SHORTCUTS[name:lower()]
+    if not expand then return text end
+    -- Keep line breaks inside the rest of the message
+    rest = text:match("^/%a+[ \t]*(.-)%s*$")
+    return expand(rest) or text
+end
 
 local CACHE_KEEP = 30 -- channels kept in the offline cache
 
@@ -299,9 +339,103 @@ function ChatView:authorName(user)
     return cleanEmoji(nick or user.global_name or user.username or "?")
 end
 
-function ChatView:renderContent(msg)
+--- Fenced code blocks of a text: { { lang, code } }, and the text with each block
+-- replaced by a placeholder ("\1" .. index .. "\1").
+local function extractCode(text)
+    local blocks = {}
+    text = text:gsub("```(.-)```", function(body)
+        local lang, code = body:match("^([%w_+#.-]*)\n(.*)$")
+        if not lang then lang, code = "", body end
+        code = code:gsub("^\n+", ""):gsub("%s+$", "")
+        table.insert(blocks, { lang = lang, code = code })
+        return "\1" .. #blocks .. "\1"
+    end)
+    return blocks, text
+end
+
+local SPOILER_CHAR = "░"
+local CODE_GUTTER = "│ "
+
+--- Code blocks of a message, forwarded messages included: { { lang, code } }.
+function ChatView.codeBlocks(msg)
+    local blocks = extractCode(msg.content or "")
+    for __, snap in ipairs(msg.message_snapshots or {}) do
+        if snap.message then
+            for __, b in ipairs(ChatView.codeBlocks(snap.message)) do table.insert(blocks, b) end
+        end
+    end
+    return blocks
+end
+
+local EBOOK_EXT = { epub = true, mobi = true, azw = true, azw3 = true, fb2 = true, djvu = true, djv = true,
+    cbz = true, cbt = true, cbr = true, kepub = true, prc = true, pdb = true, xps = true, oxps = true, chm = true }
+local TEXT_EXT = { txt = true, md = true, log = true, csv = true, json = true, xml = true, html = true, htm = true,
+    rtf = true, doc = true, docx = true, odt = true }
+
+--- Human readable file size.
+function ChatView.formatSize(bytes)
+    if not bytes then return nil end
+    if bytes < 1024 then return T(_("%1 B"), bytes) end
+    if bytes < 1024 * 1024 then return T(_("%1 KB"), math.floor(bytes / 1024 + 0.5)) end
+    return T(_("%1 MB"), string.format("%.1f", bytes / (1024 * 1024)))
+end
+
+--- Kind of an attachment: "image", "video", "audio", "pdf", "ebook", "text" or "file".
+function ChatView.attachmentKind(a)
+    local ctype = (a.content_type or ""):lower()
+    local ext = ((a.filename or ""):match("%.([%w]+)$") or ""):lower()
+    if ctype:match("^image/") then return "image" end
+    if ctype:match("^video/") then return "video" end
+    if ctype:match("^audio/") then return "audio" end
+    if ext == "pdf" or ctype == "application/pdf" then return "pdf" end
+    if EBOOK_EXT[ext] or ctype == "application/epub+zip" then return "ebook" end
+    if TEXT_EXT[ext] or ctype:match("^text/") then return "text" end
+    return "file"
+end
+
+local KIND_LABELS = {
+    image = _("image"), video = _("video"), audio = _("audio"), pdf = _("PDF"),
+    ebook = _("e-book"), text = _("text"), file = _("file"),
+}
+
+--- One line describing an attachment: kind, name and size.
+function ChatView.attachmentLine(a)
+    local parts = { a.filename or "?" }
+    local size = ChatView.formatSize(a.size)
+    if size then table.insert(parts, size) end
+    return "[" .. KIND_LABELS[ChatView.attachmentKind(a)] .. ": " .. table.concat(parts, " · ") .. "]"
+end
+
+--- Attachments that KOReader can open as documents (text, PDF, e-books).
+function ChatView.documentsOf(msg)
+    local list = {}
+    local ok, DocumentRegistry = pcall(require, "document/documentregistry")
+    for __, a in ipairs(msg.attachments or {}) do
+        local kind = ChatView.attachmentKind(a)
+        local readable = kind == "pdf" or kind == "ebook" or kind == "text"
+        if readable and ok and a.filename and not DocumentRegistry:hasProvider(a.filename) then
+            readable = false -- e.g. .docx without a provider
+        end
+        if readable and a.url then table.insert(list, a) end
+    end
+    return list
+end
+
+--- True if the message has ||spoiler|| text.
+function ChatView.hasSpoilers(msg)
+    if (msg.content or ""):find("||.-||") then return true end
+    for __, snap in ipairs(msg.message_snapshots or {}) do
+        if snap.message and ChatView.hasSpoilers(snap.message) then return true end
+    end
+    return false
+end
+
+--- Renders the text of a message. Spoilers stay hidden unless `reveal` (or the message
+-- was revealed with a tap).
+function ChatView:renderContent(msg, reveal)
     if msg.deleted then return _("(deleted message)") end
-    local text = msg.content or ""
+    if reveal == nil then reveal = self.revealed and msg.id and self.revealed[msg.id] or false end
+    local code_blocks, text = extractCode(msg.content or "")
     local mentions = {}
     for __, u in ipairs(msg.mentions or {}) do
         mentions[u.id] = self:authorName(u)
@@ -326,24 +460,39 @@ function ChatView:renderContent(msg)
         end
         return os.date("%Y-%m-%d %H:%M", ts)
     end)
-    text = text:gsub("||(.-)||", "[spoiler: %1]")
+    text = text:gsub("||(.-)||", function(hidden)
+        if reveal then return "⟦" .. hidden .. "⟧" end
+        -- As many blocks as characters, so the length gives a hint like in Discord
+        local n = select(2, hidden:gsub("[^\128-\191]", ""))
+        return SPOILER_CHAR:rep(math.max(3, math.min(n, 30)))
+    end)
     text = text:gsub("%*%*(.-)%*%*", "%1")
     text = text:gsub("__(.-)__", "%1")
     text = text:gsub("~~(.-)~~", "%1")
-    text = text:gsub("```%w*\n?", "")
+    text = text:gsub("```%w*\n?", "") -- unclosed fence
     -- Markdown headings and subtext
     text = ("\n" .. text):gsub("\n%-?#+ ", "\n"):sub(2)
+    -- Code blocks: on their own lines, with a gutter. Tap them to read them in a monospace font.
+    text = text:gsub("\n?\1(%d+)\1\n?", function(i)
+        local b = code_blocks[tonumber(i)]
+        local lines = { "┌ " .. (b.lang ~= "" and T(_("code · %1"), b.lang) or _("code")) }
+        for line in (b.code .. "\n"):gmatch("(.-)\n") do
+            table.insert(lines, CODE_GUTTER .. line)
+        end
+        table.insert(lines, "└")
+        return "\n" .. table.concat(lines, "\n") .. "\n"
+    end)
+    text = text:gsub("^\n", ""):gsub("\n$", "")
 
     local extras = {}
     for __, snap in ipairs(msg.message_snapshots or {}) do
         if snap.message then
-            local fwd = self:renderContent(snap.message)
+            local fwd = self:renderContent(snap.message, reveal)
             table.insert(extras, "» " .. _("forwarded:") .. " " .. fwd:gsub("\n", "\n   "))
         end
     end
     for __, a in ipairs(msg.attachments or {}) do
-        local kind = (a.content_type or ""):match("^image/") and _("image") or _("file")
-        table.insert(extras, "[" .. kind .. ": " .. (a.filename or "?") .. "]")
+        table.insert(extras, ChatView.attachmentLine(a))
     end
     for __, s in ipairs(msg.sticker_items or {}) do
         table.insert(extras, "[sticker: " .. (s.name or "?") .. "]")
@@ -529,7 +678,14 @@ function ChatView:buildText()
         if not compact then table.insert(out, "") end
         table.insert(out, "───── " .. _("Pending") .. " ─────")
         for __, e in ipairs(pending) do
-            local head = os.date("%H:%M", e.time) .. " " .. (e.error and ("⚠ " .. _("not sent") .. ": " .. e.error) or ("⏳ " .. _("pending")))
+            local head
+            if e.error then
+                head = os.date("%H:%M", e.time) .. " ⚠ " .. _("not sent") .. ": " .. e.error
+            elseif Outbox.isWaiting(e) then
+                head = "🕓 " .. T(_("scheduled for %1"), ChatView.formatWhen(e.send_at))
+            else
+                head = os.date("%H:%M", e.time) .. " ⏳ " .. _("pending")
+            end
             table.insert(out, head)
             table.insert(out, e.content)
         end
@@ -811,6 +967,30 @@ function ChatView:markRead()
     end
 end
 
+--- Moves the read marker back so that `msg` and everything after it count as unread.
+function ChatView:markUnreadFrom(msg)
+    local prev_id
+    for i, m in ipairs(self.messages) do
+        if m.id == msg.id then
+            prev_id = self.messages[i - 1] and self.messages[i - 1].id
+            break
+        end
+    end
+    prev_id = prev_id or DiscordAPI.idBefore(msg.id)
+    local ok, err = self.api:ackMessage(self.channel.id, prev_id, true)
+    if not ok then
+        UIManager:show(InfoMessage:new{ text = _("Could not mark as unread: ") .. tostring(err) })
+        return
+    end
+    Gateway:markRead(self.channel.id, prev_id)
+    self.new_after = prev_id
+    -- Don't mark it read again until something new arrives
+    local last = self.messages[#self.messages]
+    self.acked_id = last and last.id
+    self:redraw()
+    UIManager:show(Notification:new{ text = _("Marked as unread") })
+end
+
 --- Fetches messages newer than the last one we have. Returns the number added.
 function ChatView:catchUp()
     local last = self.messages[#self.messages]
@@ -1044,7 +1224,7 @@ function ChatView:messageAt(pos)
     for __, sp in ipairs(self.spans) do
         if charpos >= sp.from and charpos <= sp.to then
             local on_reply = sp.reply_from and charpos >= sp.reply_from and charpos <= sp.reply_to
-            return sp.msg, on_reply and true or false
+            return sp.msg, on_reply and true or false, charpos
         end
     end
     return nil
@@ -1090,13 +1270,138 @@ function ChatView:goToReplied(msg)
     self:jumpTo(id)
 end
 
+--- What is under a character position of the chat text: "spoiler" for hidden spoiler
+-- text, "code" for a line of a code block, or nil.
+function ChatView:tapTarget(charpos)
+    local tw = self.scroll_widget and self.scroll_widget.text_widget
+    if not tw or not charpos or charpos < 1 then return nil end
+    -- Text from a little before the position up to it (characters, not bytes)
+    local from = math.max(1, charpos - 2000)
+    local before
+    if tw._xtext then
+        local ok, t = pcall(tw._xtext.getText, tw._xtext, from, charpos)
+        before = ok and t or nil
+    elseif type(tw.charlist) == "table" then
+        before = table.concat(tw.charlist, "", from, math.min(charpos, #tw.charlist))
+    end
+    if not before or before == "" then return nil end
+    if before:sub(-#SPOILER_CHAR) == SPOILER_CHAR then return "spoiler" end
+    local line = before:match("[^\n]*$")
+    if line:find("^" .. CODE_GUTTER) or line:find("^┌ ") or line == "└" then
+        return "code"
+    end
+end
+
+--- Folder where downloaded files are saved: "Discord" in KOReader's home folder.
+function ChatView.downloadDir()
+    local fmu = require("apps/filemanager/filemanagerutil")
+    local home = (fmu.getHomeFolder and fmu.getHomeFolder()) or G_reader_settings:readSetting("home_dir")
+        or Device.home_dir or DataStorage:getDataDir()
+    local dir = home:gsub("/$", "") .. "/Discord"
+    if lfs.attributes(dir, "mode") ~= "directory" then lfs.mkdir(dir) end
+    return dir
+end
+
+--- Downloads an attachment to the documents folder and offers to open it.
+function ChatView:downloadFile(a)
+    local dir = ChatView.downloadDir()
+    local name = (a.filename or "file"):gsub("[/\\:*?\"<>|%c]", "_")
+    local path = dir .. "/" .. name
+    local existing = lfs.attributes(path)
+    if existing and a.size and existing.size ~= a.size then
+        -- Another file with the same name: keep both
+        local base, ext = name:match("^(.-)(%.[^.]*)$")
+        if not base then base, ext = name, "" end
+        local n = 2
+        repeat
+            path = dir .. "/" .. base .. " (" .. n .. ")" .. ext
+            n = n + 1
+        until not lfs.attributes(path)
+        existing = nil
+    end
+    local function offerOpen()
+        UIManager:show(ConfirmBox:new{
+            text = T(_("Saved to %1\n\nOpen it now?"), path),
+            ok_text = _("Open"),
+            cancel_text = _("Later"),
+            ok_callback = function() self.plugin:openDocument(path) end,
+        })
+    end
+    if existing then
+        offerOpen()
+        return
+    end
+    self.plugin:withLoading(T(_("Downloading %1…"), name), function()
+        local ok, err = self.api:download(a.url, path)
+        if not ok then
+            UIManager:show(InfoMessage:new{ text = _("Could not download the file: ") .. tostring(err) })
+            return
+        end
+        offerOpen()
+    end)
+end
+
+function ChatView:downloadFiles(files)
+    if #files == 1 then
+        self:downloadFile(files[1])
+        return
+    end
+    local dialog
+    local buttons = {}
+    for __, a in ipairs(files) do
+        table.insert(buttons, {{
+            text = a.filename .. (a.size and (" (" .. ChatView.formatSize(a.size) .. ")") or ""),
+            callback = function()
+                UIManager:close(dialog)
+                self:downloadFile(a)
+            end,
+        }})
+    end
+    dialog = ButtonDialog:new{ title = _("Download to the documents folder"), buttons = buttons }
+    UIManager:show(dialog)
+end
+
+--- Shows the hidden spoiler text of a message.
+function ChatView:revealSpoilers(msg)
+    self.revealed = self.revealed or {}
+    self.revealed[msg.id] = true
+    self:redraw()
+end
+
+--- Shows the code blocks of a message in a monospace font.
+function ChatView:showCode(msg)
+    local blocks = ChatView.codeBlocks(msg)
+    if #blocks == 0 then return end
+    local parts = {}
+    for i, b in ipairs(blocks) do
+        local part = b.code
+        if #blocks > 1 or b.lang ~= "" then
+            part = "── " .. (b.lang ~= "" and b.lang or T(_("block %1"), i)) .. " ──\n" .. part
+        end
+        table.insert(parts, part)
+    end
+    local TextViewer = require("ui/widget/textviewer")
+    UIManager:show(TextViewer:new{
+        title = T(_("Code from %1"), self:authorName(msg.author)),
+        text = cleanEmoji(table.concat(parts, "\n\n")),
+        text_type = "code",
+    })
+end
+
 --- Tap on the text: the reply line jumps to the original message; the rest opens the
 -- message if enabled in the menu, otherwise turns the page.
 function ChatView:onTapMessage(arg, ges)
     if self:inTextArea(ges.pos) then
-        local msg, on_reply = self:messageAt(ges.pos)
+        local msg, on_reply, charpos = self:messageAt(ges.pos)
+        local target = msg and not on_reply and self:tapTarget(charpos)
         if msg and on_reply then
             self:goToReplied(msg)
+            return true
+        elseif target == "spoiler" then
+            self:revealSpoilers(msg)
+            return true
+        elseif target == "code" then
+            self:showCode(msg)
             return true
         elseif msg and self.settings.tap_actions then
             self:messageActions(msg)
@@ -1139,8 +1444,11 @@ end
 
 --- Sends queued messages when the network is back; refreshes this chat if needed.
 function ChatView:flushOutbox()
-    if self.offline or Outbox.count() == 0 or not NetworkMgr:isOnline() then return end
-    local had_here = #Outbox.list(self.channel.id) > 0
+    if self.offline or Outbox.countDue() == 0 or not NetworkMgr:isOnline() then return end
+    local had_here = false
+    for __, e in ipairs(Outbox.list(self.channel.id)) do
+        if not e.error and not Outbox.isWaiting(e) then had_here = true end
+    end
     local sent = Outbox.flush(self.api)
     if #sent > 0 or had_here then
         local mine = {}
@@ -1160,7 +1468,9 @@ function ChatView:showPending()
         for __, e in ipairs(Outbox.list(self.channel.id)) do
             table.insert(items, {
                 text = oneLine(e.content, 120),
-                mandatory = e.error and _("not sent") or os.date("%H:%M", e.time),
+                mandatory = e.error and _("not sent")
+                    or (Outbox.isWaiting(e) and ChatView.formatWhen(e.send_at))
+                    or os.date("%H:%M", e.time),
                 entry = e,
             })
         end
@@ -1179,6 +1489,35 @@ function ChatView:showPending()
         onMenuSelect = function(_menu, item)
             local e = item.entry
             if not e then return true end
+            if Outbox.isWaiting(e) then
+                local choice
+                choice = ButtonDialog:new{
+                    title = T(_("Scheduled for %1"), formatWhen(e.send_at)) .. "\n\n" .. oneLine(e.content, 200),
+                    buttons = {{
+                        {
+                            text = _("Cancel message"),
+                            callback = function()
+                                UIManager:close(choice)
+                                Outbox.remove(e.id)
+                                menu:switchItemTable(_("Pending messages"), fill())
+                                self:redraw()
+                            end,
+                        },
+                        {
+                            text = _("Send now"),
+                            callback = function()
+                                UIManager:close(choice)
+                                Outbox.makeDue(e.id)
+                                menu:switchItemTable(_("Pending messages"), fill())
+                                self:flushOutbox()
+                                self:redraw()
+                            end,
+                        },
+                    }},
+                }
+                UIManager:show(choice)
+                return true
+            end
             UIManager:show(ConfirmBox:new{
                 text = _("Cancel this pending message?") .. "\n\n" .. oneLine(e.content, 200),
                 ok_text = _("Cancel message"),
@@ -1266,13 +1605,26 @@ function ChatView:compose(prefill, edit_msg)
             self:send(text, edit_msg)
         end,
     })
+    local buttons = { row }
+    if not edit_msg then
+        table.insert(buttons, {{
+            text = _("Send later…"),
+            callback = function()
+                local text = dialog:getInputText()
+                if text:match("^%s*$") then return end
+                self:sendLaterDialog(text, function()
+                    UIManager:close(dialog)
+                end)
+            end,
+        }})
+    end
     dialog = InputDialog:new{
         title = title,
         description = self.reply_to and not edit_msg and oneLine(self:renderContent(self.reply_to), 80) or nil,
         input = prefill or self:getDraft() or "",
         allow_newline = true,
         text_height = Screen:scaleBySize(120),
-        buttons = { row },
+        buttons = buttons,
         edited_callback = not edit_msg and function() self:sendTyping() end or nil,
     }
     UIManager:show(dialog)
@@ -1311,6 +1663,7 @@ function ChatView:replyRef()
 end
 
 function ChatView:send(text, edit_msg)
+    if not edit_msg then text = ChatView.expandShortcuts(text) end
     local ok, data, code
     if edit_msg then
         ok, data, code = self.api:editMessage(self.channel.id, edit_msg.id, self:applyMentions(text))
@@ -1338,6 +1691,81 @@ function ChatView:send(text, edit_msg)
     self:addMessages({ data })
     self:redraw("bottom")
     self:markRead()
+end
+
+--- Queues `text` to be sent at `send_at` (unix time), or when the connection returns if nil.
+function ChatView:sendLater(text, send_at)
+    text = ChatView.expandShortcuts(text)
+    Outbox.add(self.channel.id, self:applyMentions(text), self:replyRef(), send_at)
+    self:setDraft(nil)
+    self.reply_to = nil
+    self:redraw("bottom")
+    self.plugin:scheduleOutbox()
+    UIManager:show(Notification:new{
+        text = send_at and T(_("Scheduled for %1"), formatWhen(send_at))
+            or _("The message will be sent when the connection returns."),
+    })
+end
+
+--- Asks when to send `text`. on_done is called once it is queued.
+function ChatView:sendLaterDialog(text, on_done)
+    local dialog
+    local function pick(send_at)
+        UIManager:close(dialog)
+        on_done()
+        self:sendLater(text, send_at)
+    end
+    local now = os.time()
+    local tomorrow = os.date("*t", now + 86400)
+    tomorrow.hour, tomorrow.min, tomorrow.sec = 9, 0, 0
+    dialog = ButtonDialog:new{
+        title = _("Send later"),
+        buttons = {
+            {
+                { text = _("In 30 minutes"), callback = function() pick(now + 1800) end },
+                { text = _("In 1 hour"), callback = function() pick(now + 3600) end },
+            },
+            {
+                { text = _("In 3 hours"), callback = function() pick(now + 3 * 3600) end },
+                { text = _("Tomorrow at 9:00"), callback = function() pick(os.time(tomorrow)) end },
+            },
+            {
+                {
+                    text = _("At a time…"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        local DateTimeWidget = require("ui/widget/datetimewidget")
+                        local t = os.date("*t", now + 3600)
+                        UIManager:show(DateTimeWidget:new{
+                            hour = t.hour,
+                            min = 0,
+                            ok_text = _("Schedule"),
+                            title_text = _("Send at"),
+                            info_text = _("If the time has already passed today, it is sent tomorrow."),
+                            callback = function(time)
+                                local at = os.date("*t")
+                                at.hour, at.min, at.sec = time.hour, time.min, 0
+                                local send_at = os.time(at)
+                                if send_at <= os.time() then
+                                    at.day = at.day + 1
+                                    send_at = os.time(at)
+                                end
+                                on_done()
+                                self:sendLater(text, send_at)
+                            end,
+                        })
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("When the connection returns"),
+                    callback = function() pick(nil) end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
 end
 
 function ChatView:pickQuickReply(input_dialog)
@@ -1596,12 +2024,143 @@ function ChatView:jumpTo(message_id)
     end)
 end
 
+--- Shows the first messages of a day (local time).
+function ChatView:jumpToDate(year, month, day)
+    local t = os.time{ year = year, month = month, day = day, hour = 0, min = 0, sec = 0 }
+    self.plugin:withLoading(_("Loading messages…"), function()
+        local ok, data = self.api:getMessages(self.channel.id, { limit = 1, after = DiscordAPI.idAt(t) })
+        if not ok then
+            UIManager:show(InfoMessage:new{ text = _("Could not load messages: ") .. tostring(data) })
+            return
+        end
+        if #data == 0 then
+            UIManager:show(InfoMessage:new{ text = T(_("No messages since %1."), os.date("%Y-%m-%d", t)) })
+            return
+        end
+        self:jumpTo(data[1].id)
+    end)
+end
+
+--- Parses what was typed in "Jump to": returns "date", y, m, d or "id", message_id, or nil.
+function ChatView.parseJump(text, channel_id)
+    text = (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local link_channel, link_msg = text:match("/channels/[^/%s]+/([^/%s]+)/(%d+)")
+    if link_msg then
+        if channel_id and link_channel ~= channel_id then return "other" end
+        return "id", link_msg
+    end
+    if text:match("^%d+$") and #text >= 15 then return "id", text end
+    local y, m, d = text:match("^(%d%d%d%d)[-/.](%d%d?)[-/.](%d%d?)$")
+    if y then
+        y, m, d = tonumber(y), tonumber(m), tonumber(d)
+        if m >= 1 and m <= 12 and d >= 1 and d <= 31 then return "date", y, m, d end
+    end
+    return nil
+end
+
+function ChatView:jumpDialog()
+    local input
+    local function go(text)
+        local kind, a, b, c = ChatView.parseJump(text, self.channel.id)
+        if kind == "id" then
+            UIManager:close(input)
+            self:jumpTo(a)
+        elseif kind == "date" then
+            UIManager:close(input)
+            self:jumpToDate(a, b, c)
+        elseif kind == "other" then
+            UIManager:show(InfoMessage:new{ text = _("That link is for another channel.") })
+        else
+            UIManager:show(InfoMessage:new{ text = _("Type a date like 2026-11-20, or a message ID or link.") })
+        end
+    end
+    input = InputDialog:new{
+        title = _("Jump to"),
+        description = _("A date (2026-11-20), or a message ID or link."),
+        input = "",
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(input) end },
+            {
+                text = _("Pick a date"),
+                callback = function()
+                    UIManager:close(input)
+                    local now = os.date("*t")
+                    local DateTimeWidget = require("ui/widget/datetimewidget")
+                    UIManager:show(DateTimeWidget:new{
+                        year = now.year,
+                        month = now.month,
+                        day = now.day,
+                        ok_text = _("Go"),
+                        title_text = _("Jump to date"),
+                        callback = function(time)
+                            self:jumpToDate(time.year, time.month, time.day)
+                        end,
+                    })
+                end,
+            },
+            {
+                text = _("Go"),
+                is_enter_default = true,
+                callback = function() go(input:getInputText()) end,
+            },
+        }},
+    }
+    UIManager:show(input)
+    input:onShowKeyboard()
+end
+
+--- Looks up text in KOReader's dictionary, or in Wikipedia.
+function ChatView:lookUp(text, wikipedia)
+    local ui = self.plugin and self.plugin.ui
+    local Event = require("ui/event")
+    if wikipedia then
+        if ui and ui.wikipedia then
+            ui.wikipedia:onLookupWikipedia(text, false)
+        else
+            UIManager:sendEvent(Event:new("LookupWikipedia", text))
+        end
+    elseif ui and ui.dictionary then
+        ui.dictionary:onLookupWord(text, false)
+    else
+        UIManager:sendEvent(Event:new("LookupWord", text))
+    end
+end
+
+--- What to do with text selected in a message: look it up or copy it.
+function ChatView:selectionDialog(text)
+    local dialog
+    local row = {
+        { text = _("Dictionary"), callback = function() UIManager:close(dialog) self:lookUp(text) end },
+        { text = _("Wikipedia"), callback = function() UIManager:close(dialog) self:lookUp(text, true) end },
+    }
+    if Device:hasClipboard() then
+        table.insert(row, { text = _("Copy"), callback = function()
+            UIManager:close(dialog)
+            Device.input.setClipboardText(text)
+            UIManager:show(Notification:new{ text = _("Copied") })
+        end })
+    end
+    dialog = ButtonDialog:new{
+        title = oneLine(text, 80),
+        buttons = { row },
+    }
+    UIManager:show(dialog)
+end
+
+--- The whole message in a viewer, where words can be selected and looked up.
 function ChatView:viewFull(msg)
     local TextViewer = require("ui/widget/textviewer")
     UIManager:show(TextViewer:new{
         title = self:authorName(msg.author),
         text = self:renderContent(msg),
+        text_selection_callback = function(text)
+            if text and not text:match("^%s*$") then self:selectionDialog(text) end
+        end,
     })
+    if not self.settings.lookup_hint_shown then
+        self.settings.lookup_hint_shown = true
+        UIManager:show(Notification:new{ text = _("Hold a word to look it up. Hold and drag to select more.") })
+    end
 end
 
 -- Images
@@ -1981,6 +2540,91 @@ function ChatView:messageActions(msg)
         -- Only reading actions make sense without network
         buttons = { buttons[2], { buttons[3][1] }, { buttons[4][1] }, save_row }
     end
+    local files = not self.offline and ChatView.documentsOf(msg) or {}
+    if #files > 0 then
+        local a = files[1]
+        table.insert(buttons, 1, {{
+            text = #files == 1 and T(_("Download %1"), a.filename .. (a.size and (" (" .. ChatView.formatSize(a.size) .. ")") or ""))
+                or T(_("Download files (%1)"), #files),
+            callback = function()
+                UIManager:close(dialog)
+                self:downloadFiles(files)
+            end,
+        }})
+    end
+    local has_spoilers = ChatView.hasSpoilers(msg) and not (self.revealed and self.revealed[msg.id])
+    local has_code = #ChatView.codeBlocks(msg) > 0
+    if has_spoilers or has_code then
+        local row = {}
+        if has_spoilers then
+            table.insert(row, { text = _("Show spoilers"), callback = function()
+                UIManager:close(dialog)
+                self:revealSpoilers(msg)
+            end })
+        end
+        if has_code then
+            table.insert(row, { text = _("View code"), callback = function()
+                UIManager:close(dialog)
+                self:showCode(msg)
+            end })
+        end
+        table.insert(buttons, 1, row)
+    end
+    if not self.offline then
+        local row = {
+            {
+                text = _("Mark unread from here"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self:markUnreadFrom(msg)
+                end,
+            },
+        }
+        if self.guild and not THREAD_TYPES[self.channel.type] then
+            if msg.thread then
+                table.insert(row, {
+                    text = _("Open thread"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:openThread(msg.thread)
+                    end,
+                })
+            else
+                table.insert(row, {
+                    text = _("Start thread"),
+                    enabled = self.can_send and not SYSTEM_TYPES[msg.type],
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:startThread(msg)
+                    end,
+                })
+            end
+        end
+        table.insert(buttons, row)
+    end
+    if not mine and not self.offline and self.guild and msg.author then
+        local row = {}
+        if self:can(DiscordAPI.PERM_MANAGE_MESSAGES) then
+            table.insert(row, {
+                text = _("Delete (moderator)"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self:deleteAsModerator(msg)
+                end,
+            })
+        end
+        if not msg.webhook_id and (self:can(DiscordAPI.PERM_KICK_MEMBERS)
+                or self:can(DiscordAPI.PERM_HI_MODERATE_MEMBERS, true)) then
+            table.insert(row, {
+                text = _("Moderate author"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self:moderateMember(msg.author)
+                end,
+            })
+        end
+        if #row > 0 then table.insert(buttons, row) end
+    end
     if mine and not self.offline then
         table.insert(buttons, {
             {
@@ -2056,6 +2700,288 @@ end
 
 -- Threads
 
+-- Moderation (only offered with the matching permissions)
+
+--- Our permissions in this channel: low and high 32 bits (0, 0 outside servers).
+function ChatView:permissions()
+    if self._perms then return self._perms[1], self._perms[2] end
+    if not self.guild or self.offline then return 0, 0 end
+    local ch = self.channel
+    if THREAD_TYPES[ch.type] and ch.parent_id then ch = Gateway.channels[ch.parent_id] or ch end
+    local lo, hi = 0, 0
+    local gw_guild = Gateway.guilds[self.guild.id]
+    if gw_guild and gw_guild.roles and #gw_guild.roles > 0 then
+        lo, hi = Gateway:permissionResolver(gw_guild)(ch)
+    else
+        -- No real-time state: ask the server once
+        local ok_g, full = self.api:getGuild(self.guild.id)
+        local ok_m, member = self.api:getMyMember(self.guild.id)
+        if ok_g and ok_m and type(full) == "table" and type(member) == "table" then
+            if not (ch.permission_overwrites) then
+                local ok_c, full_ch = self.api:getChannel(ch.id)
+                if ok_c and type(full_ch) == "table" then ch = full_ch end
+            end
+            lo, hi = self.api:permissionResolver(full, member)(ch)
+        end
+    end
+    self._perms = { lo or 0, hi or 0 }
+    return self._perms[1], self._perms[2]
+end
+
+function ChatView:can(flag, high)
+    local lo, hi = self:permissions()
+    return DiscordAPI.hasPerm(high and hi or lo, flag)
+end
+
+function ChatView:deleteAsModerator(msg)
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Delete this message by %1?"), self:authorName(msg.author)) .. "\n\n" .. oneLine(self:renderContent(msg), 200),
+        ok_text = _("Delete"),
+        cancel_text = _("Cancel"),
+        ok_callback = function()
+            local ok, err = self.api:deleteMessage(self.channel.id, msg.id)
+            if ok then
+                self:removeMessage(msg.id)
+                self:redraw()
+            else
+                UIManager:show(InfoMessage:new{ text = _("Could not delete it: ") .. tostring(err) })
+            end
+        end,
+    })
+end
+
+local TIMEOUTS = {
+    { 60, _("60 seconds") }, { 300, _("5 minutes") }, { 600, _("10 minutes") },
+    { 3600, _("1 hour") }, { 86400, _("1 day") }, { 604800, _("1 week") },
+}
+
+--- Timeout and kick for the author of a message.
+function ChatView:moderateMember(user)
+    local name = self:authorName(user)
+    local dialog
+    local function done(ok, err, text)
+        if ok then
+            UIManager:show(Notification:new{ text = text })
+        else
+            UIManager:show(InfoMessage:new{ text = _("Could not do it: ") .. tostring(err) })
+        end
+    end
+    local buttons = {}
+    if self:can(DiscordAPI.PERM_HI_MODERATE_MEMBERS, true) then
+        local row = {}
+        for __, t in ipairs(TIMEOUTS) do
+            table.insert(row, {
+                text = t[2],
+                callback = function()
+                    UIManager:close(dialog)
+                    local ok, err = self.api:timeoutMember(self.guild.id, user.id, os.time() + t[1])
+                    done(ok, err, T(_("%1 is timed out for %2"), name, t[2]))
+                end,
+            })
+            if #row == 3 then
+                table.insert(buttons, row)
+                row = {}
+            end
+        end
+        table.insert(buttons, {{
+            text = _("Remove timeout"),
+            callback = function()
+                UIManager:close(dialog)
+                local ok, err = self.api:timeoutMember(self.guild.id, user.id, nil)
+                done(ok, err, T(_("Timeout removed for %1"), name))
+            end,
+        }})
+    end
+    if self:can(DiscordAPI.PERM_KICK_MEMBERS) then
+        table.insert(buttons, {{
+            text = T(_("Kick %1 from the server"), name),
+            callback = function()
+                UIManager:close(dialog)
+                UIManager:show(ConfirmBox:new{
+                    text = T(_("Kick %1 from the server? They can join again with an invite."), name),
+                    ok_text = _("Kick"),
+                    cancel_text = _("Cancel"),
+                    ok_callback = function()
+                        local ok, err = self.api:kickMember(self.guild.id, user.id)
+                        done(ok, err, T(_("%1 was kicked"), name))
+                    end,
+                })
+            end,
+        }})
+    end
+    dialog = ButtonDialog:new{
+        title = T(_("Moderate %1"), name) .. (self:can(DiscordAPI.PERM_HI_MODERATE_MEMBERS, true) and ("\n" .. _("Timeout:")) or ""),
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+local AUDIT_ACTIONS = {
+    [1] = _("updated the server"),
+    [10] = _("created a channel"), [11] = _("updated a channel"), [12] = _("deleted a channel"),
+    [13] = _("added channel permissions"), [14] = _("updated channel permissions"), [15] = _("removed channel permissions"),
+    [20] = _("kicked"), [21] = _("pruned members"), [22] = _("banned"), [23] = _("unbanned"),
+    [24] = _("updated member"), [25] = _("changed roles of"), [26] = _("moved in voice"), [27] = _("disconnected from voice"),
+    [28] = _("added a bot"),
+    [30] = _("created a role"), [31] = _("updated a role"), [32] = _("deleted a role"),
+    [40] = _("created an invite"), [41] = _("updated an invite"), [42] = _("deleted an invite"),
+    [50] = _("created a webhook"), [51] = _("updated a webhook"), [52] = _("deleted a webhook"),
+    [60] = _("added an emoji"), [61] = _("updated an emoji"), [62] = _("deleted an emoji"),
+    [72] = _("deleted a message of"), [73] = _("deleted messages in bulk"),
+    [74] = _("pinned a message of"), [75] = _("unpinned a message of"),
+    [110] = _("created a thread"), [111] = _("updated a thread"), [112] = _("deleted a thread"),
+    [140] = _("created an AutoMod rule"), [141] = _("updated an AutoMod rule"), [142] = _("deleted an AutoMod rule"),
+    [143] = _("AutoMod blocked a message of"),
+}
+
+--- One audit log entry as text: { line = summary, details = full text }.
+function ChatView:auditEntry(e, users)
+    local function userName(id)
+        local u = users[id]
+        return u and self:authorName(u) or id or "?"
+    end
+    local action = AUDIT_ACTIONS[e.action_type] or T(_("action %1"), e.action_type)
+    local changes = {}
+    for __, c in ipairs(e.changes or {}) do
+        if c.key == "communication_disabled_until" then
+            action = c.new_value and _("timed out") or _("removed the timeout of")
+        end
+        table.insert(changes, c.key .. ": " .. tostring(c.old_value ~= nil and rapidjson.encode(c.old_value) or "—")
+            .. " → " .. tostring(c.new_value ~= nil and rapidjson.encode(c.new_value) or "—"))
+    end
+    local target
+    if e.target_id then
+        if users[e.target_id] then
+            target = userName(e.target_id)
+        elseif Gateway.channels[e.target_id] and Gateway.channels[e.target_id].name then
+            target = "#" .. cleanEmoji(Gateway.channels[e.target_id].name, true)
+        end
+    end
+    local ms = DiscordAPI.idTime and DiscordAPI.idTime(e.id)
+    local when = ms and os.date("%Y-%m-%d %H:%M", ms) or ""
+    local line = userName(e.user_id) .. " " .. action .. (target and (" " .. target) or "")
+    if e.options and e.options.count then line = line .. " (" .. e.options.count .. ")" end
+    local details = { when, line }
+    if e.reason and e.reason ~= "" then table.insert(details, T(_("Reason: %1"), e.reason)) end
+    if #changes > 0 then
+        table.insert(details, "")
+        for __, c in ipairs(changes) do table.insert(details, c) end
+    end
+    return { line = line, when = when, details = table.concat(details, "\n") }
+end
+
+--- Read-only list of the latest audit log entries of this server.
+function ChatView:showAuditLog()
+    self.plugin:withLoading(_("Loading the audit log…"), function()
+        local ok, data = self.api:getAuditLog(self.guild.id, 50)
+        if not ok then
+            UIManager:show(InfoMessage:new{ text = _("Could not load the audit log: ") .. tostring(data) })
+            return
+        end
+        local users = {}
+        for __, u in ipairs(data.users or {}) do users[u.id] = u end
+        local items = {}
+        for __, e in ipairs(data.audit_log_entries or {}) do
+            local entry = self:auditEntry(e, users)
+            table.insert(items, { text = entry.line, mandatory = entry.when:sub(6), entry = entry })
+        end
+        if #items == 0 then
+            table.insert(items, { text = _("The audit log is empty."), select_enabled = false })
+        end
+        local menu
+        menu = Menu:new{
+            title = _("Audit log"),
+            item_table = items,
+            is_borderless = true,
+            is_popout = false,
+            covers_fullscreen = true,
+            items_max_lines = 2,
+            onMenuSelect = function(_menu, item)
+                if not item.entry then return true end
+                local TextViewer = require("ui/widget/textviewer")
+                UIManager:show(TextViewer:new{ title = _("Audit log"), text = item.entry.details })
+                return true
+            end,
+        }
+        menu.close_callback = function() UIManager:close(menu) end
+        UIManager:show(menu)
+    end)
+end
+
+--- Opens a thread of this channel.
+function ChatView:openThread(thread)
+    local th = Gateway.channels[thread.id] or thread
+    local guild_name = cleanEmoji(self.guild.name or "", true)
+    local parent = cleanEmoji(self.channel.name or "", true)
+    local name = cleanEmoji(th.name or "?", true)
+    self.channel_names = self.channel_names or {}
+    self.channel_names[th.id] = th.name
+    local archived = th.thread_metadata and th.thread_metadata.archived
+    self.plugin:openChannel(th, self.guild, name, guild_name .. " › #" .. parent, self.channel_names, not archived)
+end
+
+--- Asks for a name and starts a thread from a message.
+function ChatView:startThread(msg)
+    local default = oneLine((msg.content or ""):gsub("<[^>]+>", ""):gsub("[*_~|`]", ""), 80)
+    if default:match("^%s*$") then default = T(_("Thread of %1"), self:authorName(msg.author)) end
+    local input
+    input = InputDialog:new{
+        title = _("Start thread"),
+        description = oneLine(self:renderContent(msg), 80),
+        input = default,
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(input) end },
+            {
+                text = _("Start"),
+                is_enter_default = true,
+                callback = function()
+                    local name = input:getInputText():gsub("^%s+", ""):gsub("%s+$", "")
+                    if name == "" then return end
+                    UIManager:close(input)
+                    self.plugin:withLoading(_("Starting thread…"), function()
+                        local util_chars = util.splitToChars(name)
+                        if #util_chars > 100 then name = table.concat(util_chars, "", 1, 100) end
+                        local ok, th = self.api:startThread(self.channel.id, msg.id, name)
+                        if not ok then
+                            UIManager:show(InfoMessage:new{ text = _("Could not start the thread: ") .. tostring(th) })
+                            return
+                        end
+                        th.joined = true -- the author follows it
+                        th.guild_id = th.guild_id or self.guild.id
+                        Gateway.channels[th.id] = Gateway.channels[th.id] or th
+                        Gateway.channels[th.id].joined = true
+                        msg.thread = th
+                        self:openThread(th)
+                    end)
+                end,
+            },
+        }},
+    }
+    UIManager:show(input)
+    input:onShowKeyboard()
+end
+
+--- True if we follow the thread shown in this view.
+function ChatView:isFollowing()
+    local c = Gateway.channels[self.channel.id]
+    return (c and c.joined) or self.channel.joined or false
+end
+
+function ChatView:toggleFollow()
+    local follow = not self:isFollowing()
+    local ok, err = self.api:followThread(self.channel.id, follow)
+    if not ok then
+        UIManager:show(InfoMessage:new{ text = _("Could not change it: ") .. tostring(err) })
+        return
+    end
+    local c = Gateway.channels[self.channel.id]
+    if c then c.joined = follow or nil end
+    self.channel.joined = follow or nil
+    UIManager:show(Notification:new{
+        text = follow and _("Following this thread") or _("No longer following this thread"),
+    })
+end
+
 function ChatView:showThreads()
     local parent_id = THREAD_TYPES[self.channel.type] and self.channel.parent_id or self.channel.id
     self.plugin:openThreadList(parent_id, self.guild, self.channel_names)
@@ -2066,7 +2992,7 @@ function ChatView:showMenu()
     local dialog
     local function close() UIManager:close(dialog) end
     dialog = ButtonDialog:new{
-        buttons = {
+        buttons = compactRows({
             {
                 {
                     text = _("Go to bottom"),
@@ -2083,6 +3009,13 @@ function ChatView:showMenu()
                         self.scroll_widget:scrollToTop()
                         UIManager:setDirty(self, "ui")
                     end,
+                },
+            },
+            {
+                {
+                    text = _("Jump to date or message"),
+                    enabled = not self.offline,
+                    callback = function() close() self:jumpDialog() end,
                 },
             },
             {
@@ -2135,7 +3068,18 @@ function ChatView:showMenu()
                     enabled = not self.offline,
                     callback = function() close() require("discord_members").show(self.plugin, self) end,
                 },
+                THREAD_TYPES[self.channel.type] and {
+                    text = self:isFollowing() and _("Unfollow thread") or _("Follow thread"),
+                    enabled = not self.offline,
+                    callback = function() close() self:toggleFollow() end,
+                } or nil,
             },
+            self.guild and not self.offline and self:can(DiscordAPI.PERM_VIEW_AUDIT_LOG) and {
+                {
+                    text = _("Audit log"),
+                    callback = function() close() self:showAuditLog() end,
+                },
+            } or nil,
             {
                 {
                     text = T(_("Pending messages (%1)"), #Outbox.list(self.channel.id)),
@@ -2190,7 +3134,7 @@ function ChatView:showMenu()
                     end,
                 },
             },
-        },
+        }),
     }
     UIManager:show(dialog)
 end

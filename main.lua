@@ -113,7 +113,11 @@ function Discord:init()
     if self.ui.highlight then
         self:addToHighlightDialog()
     end
+    if self.ui.dictionary and self.ui.dictionary.addToDictButtons then
+        self:addToDictButtons()
+    end
     self:setupGatewayListeners()
+    self:scheduleOutbox()
     if self:wantsBackgroundConnection() and Gateway.state == "disconnected" then
         -- Not during startup: connecting and loading READY takes a few seconds
         UIManager:scheduleIn(15, function() self:updateConnection() end)
@@ -185,10 +189,32 @@ function Discord:updateConnection()
     end
 end
 
+--- Wakes up when the next message scheduled with "Send later" is due.
+function Discord:scheduleOutbox()
+    if shared.outbox_timer then
+        UIManager:unschedule(shared.outbox_timer)
+        shared.outbox_timer = nil
+    end
+    local due = Outbox.nextScheduled()
+    if not due then return end
+    shared.outbox_timer = function()
+        shared.outbox_timer = nil
+        if #shared.views > 0 then
+            -- Open chats send the queue and show what was sent
+            for __, view in ipairs(shared.views) do pcall(view.flushOutbox, view) end
+        elseif NetworkMgr:isOnline() then
+            Outbox.flush(shared.api)
+        end
+        -- Without network, it goes out when the connection returns
+        self:scheduleOutbox()
+    end
+    UIManager:scheduleIn(math.max(1, due - os.time()), shared.outbox_timer)
+end
+
 function Discord:onNetworkConnected()
-    if require("discord_outbox").count() > 0 then
+    if Outbox.count() > 0 then
         UIManager:scheduleIn(4, function()
-            if #shared.views == 0 then require("discord_outbox").flush(self.api) end
+            if #shared.views == 0 then Outbox.flush(self.api) end
         end)
     end
     if self:realtimeEnabled() then
@@ -240,6 +266,7 @@ function Discord:onReaderReady()
     if self.settings.statusbar_counter then StatusBar.attach(self.ui) end
     local ok, page = pcall(function() return self.ui:getCurrentPage() end)
     if ok then self.current_page = page end
+    require("discord_bookclub").startSession(self)
     if self.settings.share_reading then
         self:updateConnection()
         self:updateActivity(true)
@@ -250,6 +277,7 @@ function Discord:onPageUpdate(pageno)
     self.current_page = pageno
     if self.settings.share_reading then self:updateActivity() end
     if shared.reading then
+        require("discord_bookclub").trackPage(pageno)
         local ok, err = pcall(require("discord_bookclub").onPage, self, pageno)
         if not ok then logger.warn("Discord: book club progress failed", err) end
     end
@@ -263,6 +291,10 @@ function Discord:onAnnotationsModified(items)
 end
 
 function Discord:onCloseDocument()
+    if shared.reading then
+        local ok, err = pcall(require("discord_bookclub").endSession, self)
+        if not ok then logger.warn("Discord: book club summary failed", err) end
+    end
     shared.reading = false
     StatusBar.detach()
     if Gateway.activity then Gateway:setActivity(nil) end
@@ -274,12 +306,16 @@ function Discord:onFlushSettings()
 end
 
 function Discord:onSuspend()
+    require("discord_bookclub").onSuspend()
     -- Keep the session so it can be resumed (cheaper than a new READY)
     Gateway:stop(true)
 end
 
 function Discord:onResume()
     shared.battery_warned = false
+    require("discord_bookclub").onResume()
+    -- Timers don't count the time spent asleep
+    self:scheduleOutbox()
     -- Wi-Fi takes a moment to come back; NetworkConnected is not sent on every device
     for __, delay in ipairs({ 5, 20, 60 }) do
         UIManager:scheduleIn(delay, function()
@@ -1255,6 +1291,10 @@ function Discord:getBookClubMenu()
     end
     table.insert(items, toggle(_("Send when a chapter is finished"), "chapters"))
     table.insert(items, toggle(_("Send my highlights"), "highlights"))
+    table.insert(items, toggle(_("Post a summary when I close the book"), "summary"))
+    local ask = toggle(_("Ask before posting the summary"), "summary_ask")
+    ask.enabled_func = function() return club().summary end
+    table.insert(items, ask)
     table.insert(items, {
         text = _("Send my progress now"),
         enabled_func = function() return club().channel ~= nil end,
@@ -2546,7 +2586,9 @@ function Discord:openThreadList(parent_id, guild, channel_names)
                 table.insert(items, {
                     text = name,
                     bold = bold,
-                    mandatory = mark or (archived and _("archived")) or nil,
+                    mandatory = mark or (archived and _("archived"))
+                        or ((th.joined or (Gateway.channels[th.id] and Gateway.channels[th.id].joined)) and _("following"))
+                        or nil,
                     callback = function()
                         self:openChannel(th, guild, name, guild_name .. " › #" .. parent_name, channel_names,
                             not archived)
@@ -2622,12 +2664,16 @@ function Discord:openAsDocument(view)
         end
         f:write(table.concat(html, "\n"))
         f:close()
-        -- Close Discord screens, then open the document in the reader
-        for i = #shared.views, 1, -1 do UIManager:close(shared.views[i]) end
-        for i = #shared.lists, 1, -1 do UIManager:close(shared.lists[i]) end
-        UIManager:nextTick(function()
-            require("apps/reader/readerui"):showReader(path)
-        end)
+        self:openDocument(path)
+    end)
+end
+
+--- Closes the Discord screens and opens a file in the reader.
+function Discord:openDocument(path)
+    for i = #shared.views, 1, -1 do UIManager:close(shared.views[i]) end
+    for i = #shared.lists, 1, -1 do UIManager:close(shared.lists[i]) end
+    UIManager:nextTick(function()
+        require("apps/reader/readerui"):showReader(path)
     end)
 end
 
@@ -2648,6 +2694,76 @@ function Discord:addToHighlightDialog()
     end)
 end
 
+--- "Send to Discord" in the dictionary and Wikipedia popups.
+function Discord:addToDictButtons()
+    self.ui.dictionary:addToDictButtons({
+        id = "discord_send",
+        text = _("Send to Discord"),
+        conditional = true,
+        show_func = function() return self:isLoggedIn() end,
+        callback = function(dict_popup) self:shareLookup(dict_popup) end,
+    })
+end
+
+--- Older KOReader versions build the popup buttons with this event instead.
+function Discord:onDictButtonsReady(dict_popup, buttons)
+    if self.ui.dictionary and self.ui.dictionary.addToDictButtons then return end
+    if not self:isLoggedIn() then return end
+    table.insert(buttons, {{
+        id = "discord_send",
+        text = _("Send to Discord"),
+        callback = function() self:shareLookup(dict_popup) end,
+    }})
+end
+
+local function truncateChars(text, max)
+    local chars = util.splitToChars(text)
+    if #chars <= max then return text end
+    return util.trim(table.concat(chars, "", 1, max)) .. "…"
+end
+
+--- The message to send for what a dictionary or Wikipedia popup shows.
+function Discord.lookupMessage(dict_popup)
+    local r = dict_popup.results and dict_popup.results[dict_popup.dict_index or 1] or {}
+    local word = util.trim(r.word or dict_popup.lookupword or dict_popup.word or "")
+    local definition = r.definition or dict_popup.definition or ""
+    if r.is_html or dict_popup.is_html then definition = util.htmlToPlainText(definition) end
+    definition = util.trim((definition:gsub("\n%s*\n+", "\n")))
+    if dict_popup.is_wiki then
+        local lang = (r.lang or dict_popup.lang or "en"):lower()
+        local title = word:gsub(" ", "_")
+        local url = "https://" .. lang .. ".wikipedia.org/wiki/"
+            .. title:gsub("[^%w%-_.~()/:,'\128-\255]", function(c) return string.format("%%%02X", c:byte()) end)
+        local summary = definition:match("^[^\n]+") or ""
+        local text = "**" .. word .. "**"
+        if summary ~= "" and summary ~= word then text = text .. " — " .. truncateChars(summary, 300) end
+        return text .. "\n" .. url
+    end
+    local text = "**" .. word .. "**"
+    if r.dict and r.dict ~= "" then text = text .. " (*" .. r.dict .. "*)" end
+    return text .. "\n" .. truncateChars(definition, 1700)
+end
+
+--- Sends the current dictionary or Wikipedia result to a chat.
+function Discord:shareLookup(dict_popup)
+    local text = Discord.lookupMessage(dict_popup)
+    self:pickDestination(dict_popup.is_wiki and _("Send article to…") or _("Send definition to…"), function(e)
+        self:sendTo(e, text)
+    end)
+end
+
+--- Sends a message to a favorite or recent chat, with feedback.
+function Discord:sendTo(e, text)
+    self:withLoading(_("Sending…"), function()
+        local ok, err = self.api:sendMessage(e.id, text)
+        if ok then
+            UIManager:show(Notification:new{ text = T(_("Sent to %1"), e.title or "?") })
+        else
+            UIManager:show(InfoMessage:new{ text = _("Could not send: ") .. tostring(err) })
+        end
+    end)
+end
+
 function Discord:shareText(text)
     local props = self.ui.doc_props or {}
     local book = props.display_title or props.title
@@ -2656,14 +2772,7 @@ function Discord:shareText(text)
         quoted = quoted .. "\n— *" .. book .. "*"
     end
     self:pickDestination(_("Send highlight to…"), function(e)
-        self:withLoading(_("Sending…"), function()
-            local ok, err = self.api:sendMessage(e.id, quoted)
-            if ok then
-                UIManager:show(Notification:new{ text = T(_("Sent to %1"), e.title or "?") })
-            else
-                UIManager:show(InfoMessage:new{ text = _("Could not send: ") .. tostring(err) })
-            end
-        end)
+        self:sendTo(e, quoted)
     end)
 end
 
