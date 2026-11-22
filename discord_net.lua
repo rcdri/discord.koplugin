@@ -100,6 +100,24 @@ function Net.tlsParams()
     return params
 end
 
+-- One TLS context is shared by all connections. Building one loads and parses the whole
+-- CA bundle (~0.7 MB of native memory each). Lua's garbage collector only sees a small
+-- userdata, so contexts made per connection piled up for a long time before being freed
+-- and the e-reader eventually ran out of memory.
+local shared_ctx, shared_key
+
+--- The TLS context for the current settings, and the parameters it was built from.
+function Net.context()
+    local params = Net.tlsParams()
+    local key = (params.verify == "none" and "none" or "peer") .. "|" .. tostring(params.cafile)
+    if shared_key ~= key or not shared_ctx then
+        local ctx, err = ssl.newcontext(params)
+        if not ctx then return nil, err, params end
+        shared_ctx, shared_key = ctx, key
+    end
+    return shared_ctx, nil, params
+end
+
 --- True if an error message comes from a failed certificate check.
 function Net.isCertError(err)
     err = tostring(err or ""):lower()
@@ -137,8 +155,12 @@ end
 function Net.connect(host, port, timeout)
     local sock, err = Net.tcp(host, port, timeout)
     if not sock then return nil, err end
-    local params = Net.tlsParams()
-    local conn, werr = ssl.wrap(sock, params)
+    local ctx, cerr, params = Net.context()
+    if not ctx then
+        sock:close()
+        return nil, cerr
+    end
+    local conn, werr = ssl.wrap(sock, ctx)
     if not conn then
         sock:close()
         return nil, werr
